@@ -81,7 +81,7 @@ smallvec = { version = "1.10", features = ["serde", "union"] }
 winapi = { version = "0.3", features = ["wincrypt", "ws2def", "ws2ipdef", "ws2tcpip"] }
 
 [dev-dependencies]
-mio = { version = "0.8", features = ["net", "os-poll"] }
+mio = { version = "1.0", features = ["net", "os-poll"] }
 url = "2.5"
 
 [lib]
