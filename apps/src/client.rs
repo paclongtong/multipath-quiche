@@ -49,6 +49,11 @@ pub enum ClientError {
     Other(String),
 }
 
+pub enum SubPacketType {
+    Data,
+    Ack,
+}
+
 pub fn connect(
     args: ClientArgs, conn_args: CommonArgs,
     output_sink: impl FnMut(String) + 'static,
@@ -559,18 +564,21 @@ pub fn connect(
         }
 
         // Determine in which order we are going to iterate over paths.
-        let scheduled_tuples = lowest_latency_scheduler(&conn);
+        // let scheduled_tuples = lowest_latency_scheduler(&conn);
+        let scheduled_tuples = lowest_latency_scheduler_flagged(&conn);
 
         // Generate outgoing QUIC packets and send them on the UDP socket, until
         // quiche reports that there are no more packets to be sent.
-        for (local_addr, peer_addr) in scheduled_tuples {
+        for (local_addr, peer_addr, is_low_latency) in scheduled_tuples {
             let token = src_addr_to_token[&local_addr];
             let socket = &sockets[token];
+            let is_ack = is_low_latency;
             loop {
-                let (write, send_info) = match conn.send_on_path(
+                let (write, send_info) = match conn.send_on_path_separate(
                     &mut out,
                     Some(local_addr),
                     Some(peer_addr),
+                    Some(is_ack)
                 ) {
                     Ok(v) => v,
 
@@ -717,3 +725,86 @@ fn lowest_latency_scheduler(
         .sorted_by_key(|p| p.rtt)
         .map(|p| (p.local_addr, p.peer_addr))
 }
+
+// lowest_latency_scheduler returns (local_addr, peer_addr, is_low_latency)
+fn lowest_latency_scheduler_flagged(conn: &quiche::Connection) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr, bool)> {
+    use itertools::Itertools;
+    // Get all active paths sorted by increasing RTT.
+    let sorted_paths: Vec<_> = conn.path_stats()
+        .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
+        .sorted_by_key(|p| p.rtt)
+        .map(|p| (p.local_addr, p.peer_addr))
+        .collect();
+    // Mark the first (lowest RTT) tuple as low latency.
+    sorted_paths.into_iter().enumerate().map(|(i, (laddr, paddr))| (laddr, paddr, i == 0))
+}
+
+/// Generate an ordered list of 4-tuples on which the host should send ACK packets,
+/// prioritizing low-latency paths.
+fn low_latency_ack_scheduler(
+    conn: &quiche::Connection,
+) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr)> {
+    use itertools::Itertools;
+    conn.path_stats()
+        .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
+        .sorted_by_key(|p| p.rtt) // Lowest latency first
+        .map(|p| (p.local_addr, p.peer_addr))
+}
+
+
+
+/// Generate an ordered list of 4-tuples on which the host should send data packets,
+/// prioritizing high-bandwidth paths using delivery rate as a proxy for bandwidth.
+fn high_bandwidth_data_scheduler(
+    conn: &quiche::Connection,
+) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr)> {
+    use itertools::Itertools;
+    conn.path_stats()
+        .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
+        .sorted_by_key(|p| std::cmp::Reverse(p.delivery_rate)) // Highest delivery rate (bandwidth) first
+        .map(|p| (p.local_addr, p.peer_addr))
+}
+
+
+// // Example usage in sending logic
+// fn send_packets_with_custom_scheduler(
+//     conn: &mut quiche::Connection,
+//     sockets: &std::collections::HashMap<usize, std::net::UdpSocket>,
+//     src_addr_to_token: &std::collections::HashMap<std::net::SocketAddr, usize>,
+//     out: &mut [u8],
+// ) -> Result<(), ClientError> {
+//     // Data scheduler for high-bandwidth paths
+//     let data_tuples = high_bandwidth_data_scheduler(conn);
+
+//     // ACK scheduler for low-latency paths
+//     let ack_tuples = low_latency_ack_scheduler(conn);
+
+//     // Send data packets over high-bandwidth paths
+//     for (local_addr, peer_addr) in data_tuples {
+//         let token = src_addr_to_token[&local_addr];
+//         let socket = &sockets[&token];
+//         loop {
+//             let (write, send_info) = match conn.send_on_path(
+//                 out,
+//                 Some(local_addr),
+//                 Some(peer_addr),
+//             ) {
+//                 Ok(v) => v,
+//                 Err(quiche::Error::Done) => break,
+//                 Err(e) => {
+//                     conn.close(false, 0x1, b"fail").ok();
+//                     break;
+//                 }
+//             };
+
+//             socket.send_to(&out[..write], send_info.to)?;
+//         }
+//     }
+
+//     // Send ACK packets over low-latency paths
+//     for (local_addr, peer_addr) in ack_tuples {
+//         conn.send_ack_eliciting_on_path(local_addr, peer_addr)?;
+//     }
+
+//     Ok(())
+// }
