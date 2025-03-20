@@ -2,3 +2,10 @@
 **/*.rs.bk
 **/Cargo.lock
 **/*.*qlog
+target/release/original/
+target/release/separate_stream_ack/
+# Ignore Rust build artifacts
+/target/
+
+# Ignore Git submodule packs
+.git/modules/
