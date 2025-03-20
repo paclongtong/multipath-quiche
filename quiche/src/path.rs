@@ -759,7 +759,7 @@ impl PathMap {
             addrs_to_paths,
             events: VecDeque::new(),
             is_server,
-            multipath: false,
+            multipath: true,
             path_abandon: VecDeque::new(),
             path_status_to_advertise: VecDeque::new(),
             next_path_status_seq_num: 0,
