@@ -780,7 +780,7 @@ impl Http3Conn {
     pub fn with_urls(
         conn: &mut quiche::Connection, 
         // urls: &[url::Url], 
-        req_specs: &Vec<RequestSpec>, reqs_cardinal: u64,
+        req_specs: &[RequestSpec], reqs_cardinal: u64,
         req_headers: &[String], body: &Option<Vec<u8>>, method: &str,
         send_priority_update: bool, max_field_section_size: Option<u64>,
         qpack_max_table_capacity: Option<u64>,
@@ -792,6 +792,7 @@ impl Http3Conn {
         // for url in urls {
         for req_spec in req_specs{
             for i in 1..=reqs_cardinal {
+                println!("DEBUG: req_spec: method = {}, url = {}", req_spec.method, req_spec.url);
                 let authority = match req_spec.url.port() {
                     Some(port) => format!("{}:{}", req_spec.url.host_str().unwrap(), port),
 
@@ -799,7 +800,7 @@ impl Http3Conn {
                 };
 
                 let mut hdrs = vec![
-                    quiche::h3::Header::new(b":method", method.as_bytes()),
+                    quiche::h3::Header::new(b":method", req_spec.method.as_bytes()),
                     quiche::h3::Header::new(b":scheme", req_spec.url.scheme().as_bytes()),
                     quiche::h3::Header::new(b":authority", authority.as_bytes()),
                     quiche::h3::Header::new(
