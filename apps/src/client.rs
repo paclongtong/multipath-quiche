@@ -378,7 +378,7 @@ pub fn connect(
 
             if alpns::HTTP_09.contains(&app_proto) {
                 http_conn = Some(Http09Conn::with_urls(
-                    &args.urls,
+                    &args.reqs,
                     args.reqs_cardinal,
                     Rc::clone(&output_sink),
                 ));
@@ -397,7 +397,8 @@ pub fn connect(
 
                 http_conn = Some(Http3Conn::with_urls(
                     &mut conn,
-                    &args.urls,
+                    // &args.urls,
+                    &args.reqs,
                     args.reqs_cardinal,
                     &args.req_headers,
                     &args.body,

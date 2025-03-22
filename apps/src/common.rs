@@ -50,6 +50,7 @@ use quiche::ConnectionId;
 
 use quiche::h3::NameValue;
 use quiche::h3::Priority;
+use crate::args::*;
 
 pub fn stdout_sink(out: String) {
     print!("{out}");
@@ -407,15 +408,29 @@ impl Default for Http09Conn {
 
 impl Http09Conn {
     pub fn with_urls(
-        urls: &[url::Url], reqs_cardinal: u64,
+        // urls: &[url::Url], 
+        req_specs: &[RequestSpec], 
+        reqs_cardinal: u64,
         output_sink: Rc<RefCell<dyn FnMut(String)>>,
     ) -> Box<dyn HttpConn> {
         let mut reqs = Vec::new();
-        for url in urls {
+        // for url in urls {
+        //     for i in 1..=reqs_cardinal {
+        //         let request_line = format!("GET {}\r\n", url.path());
+        //         reqs.push(Http09Request {
+        //             url: url.clone(),
+        //             cardinal: i,
+        //             request_line,
+        //             stream_id: None,
+        //             response_writer: None,
+        //         });
+        //     }
+        // }
+        for req_spec in req_specs {  // `reqs` is now Vec<RequestSpec>
             for i in 1..=reqs_cardinal {
-                let request_line = format!("GET {}\r\n", url.path());
+                let request_line = format!("{} {}\r\n", req_spec.method, req_spec.url.path());
                 reqs.push(Http09Request {
-                    url: url.clone(),
+                    url: req_spec.url.clone(),
                     cardinal: i,
                     request_line,
                     stream_id: None,
@@ -423,6 +438,7 @@ impl Http09Conn {
                 });
             }
         }
+        
 
         let h_conn = Http09Conn {
             stream_id: 0,
@@ -762,7 +778,9 @@ pub struct Http3Conn {
 impl Http3Conn {
     #[allow(clippy::too_many_arguments)]
     pub fn with_urls(
-        conn: &mut quiche::Connection, urls: &[url::Url], reqs_cardinal: u64,
+        conn: &mut quiche::Connection, 
+        // urls: &[url::Url], 
+        req_specs: &Vec<RequestSpec>, reqs_cardinal: u64,
         req_headers: &[String], body: &Option<Vec<u8>>, method: &str,
         send_priority_update: bool, max_field_section_size: Option<u64>,
         qpack_max_table_capacity: Option<u64>,
@@ -771,27 +789,30 @@ impl Http3Conn {
         output_sink: Rc<RefCell<dyn FnMut(String)>>,
     ) -> Box<dyn HttpConn> {
         let mut reqs = Vec::new();
-        for url in urls {
+        // for url in urls {
+        for req_spec in req_specs{
             for i in 1..=reqs_cardinal {
-                let authority = match url.port() {
-                    Some(port) => format!("{}:{}", url.host_str().unwrap(), port),
+                let authority = match req_spec.url.port() {
+                    Some(port) => format!("{}:{}", req_spec.url.host_str().unwrap(), port),
 
-                    None => url.host_str().unwrap().to_string(),
+                    None => req_spec.url.host_str().unwrap().to_string(),
                 };
 
                 let mut hdrs = vec![
                     quiche::h3::Header::new(b":method", method.as_bytes()),
-                    quiche::h3::Header::new(b":scheme", url.scheme().as_bytes()),
+                    quiche::h3::Header::new(b":scheme", req_spec.url.scheme().as_bytes()),
                     quiche::h3::Header::new(b":authority", authority.as_bytes()),
                     quiche::h3::Header::new(
                         b":path",
-                        url[url::Position::BeforePath..].as_bytes(),
+                        // url[url::Position::BeforePath..].as_bytes(),
+                        req_spec.url[url::Position::BeforePath..].as_bytes(),
                     ),
                     quiche::h3::Header::new(b"user-agent", b"quiche"),
                 ];
 
                 let priority = if send_priority_update {
-                    priority_from_query_string(url)
+                    // priority_from_query_string(url)
+                    priority_from_query_string(&req_spec.url)
                 } else {
                     None
                 };
@@ -819,7 +840,8 @@ impl Http3Conn {
                 }
 
                 reqs.push(Http3Request {
-                    url: url.clone(),
+                    // url: url.clone(),
+                    url: req_spec.url.clone(),
                     cardinal: i,
                     hdrs,
                     priority,
