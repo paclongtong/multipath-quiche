@@ -982,6 +982,7 @@ impl Http3Conn {
 
                 _ => (),
             }
+            trace!("path = {:?}", path)
         }
 
         let decided_method = match method {
@@ -1092,7 +1093,7 @@ impl Http3Conn {
 
         let url = format!("{decided_scheme}://{decided_host}{decided_path}");
         let url = url::Url::parse(&url).unwrap();
-
+        trace!("url in build_h3_response: {}", url);
         let pathbuf = path::PathBuf::from(url.path());
         let pathbuf = autoindex(pathbuf, index);
 
@@ -1110,6 +1111,7 @@ impl Http3Conn {
                     if let path::Component::Normal(v) = c {
                         file_path.push(v)
                     }
+                    trace!("file path = {:?}", file_path)
                 }
 
                 match std::fs::read(file_path.as_path()) {
