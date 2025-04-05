@@ -36,7 +36,30 @@ use super::common::alpns;
 pub trait Args {
     fn with_docopt(docopt: &docopt::Docopt) -> Self;
 }
-
+pub struct RequestSpec {
+    pub method: String,
+    pub url: url::Url,
+}
+impl RequestSpec {
+    /// Parse a raw request string. If it contains a colon (":") and the part before
+    /// the colon is one of the allowed methods, use that; otherwise use the provided global method.
+    pub fn parse(raw: &str, global_method: &str) -> Self {
+        let allowed_methods = ["GET", "PUT", "POST", "DELETE", "HEAD", "OPTIONS"];
+        if let Some((m, rest)) = raw.split_once(':') {
+            if allowed_methods.contains(&m.to_uppercase().as_str()) {
+                return RequestSpec {
+                    method: m.to_uppercase(),
+                    url: url::Url::parse(rest).expect("Invalid URL"),
+                };
+            }
+        }
+        // Otherwise, use the global default method.
+        RequestSpec {
+            method: global_method.to_string(),
+            url: url::Url::parse(raw).expect("Invalid URL"),
+        }
+    }
+}
 /// Contains commons arguments for creating a quiche QUIC connection.
 pub struct CommonArgs {
     pub alpns: Vec<&'static [u8]>,
@@ -325,6 +348,7 @@ pub struct ClientArgs {
     pub dump_response_path: Option<String>,
     pub dump_json: Option<usize>,
     pub urls: Vec<url::Url>,
+    pub reqs: Vec<RequestSpec>,
     pub reqs_cardinal: u64,
     pub req_headers: Vec<String>,
     pub no_verify: bool,
@@ -376,6 +400,13 @@ impl Args for ClientArgs {
             .get_vec("--header")
             .into_iter()
             .map(|x| x.to_string())
+            .collect();
+
+        let raw_urls = args.get_vec("URL");
+        let global_method = args.get_str("--method");
+        let reqs: Vec<RequestSpec> = raw_urls
+            .into_iter()
+            .map(|s| RequestSpec::parse(s, global_method))
             .collect();
 
         let reqs_cardinal = args.get_str("--requests");
@@ -497,6 +528,7 @@ impl Args for ClientArgs {
             dump_response_path,
             dump_json,
             urls,
+            reqs,
             reqs_cardinal,
             req_headers,
             no_verify,
@@ -524,6 +556,7 @@ impl Default for ClientArgs {
             dump_json: None,
             urls: vec![],
             req_headers: vec![],
+            reqs: vec![],
             reqs_cardinal: 1,
             no_verify: false,
             trust_origin_ca_pem: None,

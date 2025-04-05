@@ -69,8 +69,8 @@ pub fn connect(
     let mut events = mio::Events::with_capacity(1024);
 
     // We'll only connect to the first server provided in URL list.
-    let connect_url = &args.urls[0];
-
+    // let connect_url = &args.urls[0];
+    let connect_url = &args.reqs[0].url;
     // Resolve server address.
     let peer_addr = if let Some(addr) = &args.connect_to {
         addr.parse().expect("--connect-to is expected to be a string containing an IPv4 or IPv6 address with a port. E.g. 192.0.2.0:443")
@@ -383,7 +383,7 @@ pub fn connect(
 
             if alpns::HTTP_09.contains(&app_proto) {
                 http_conn = Some(Http09Conn::with_urls(
-                    &args.urls,
+                    &args.reqs,
                     args.reqs_cardinal,
                     Rc::clone(&output_sink),
                 ));
@@ -402,7 +402,8 @@ pub fn connect(
 
                 http_conn = Some(Http3Conn::with_urls(
                     &mut conn,
-                    &args.urls,
+                    // &args.urls,
+                    &args.reqs,
                     args.reqs_cardinal,
                     &args.req_headers,
                     &args.body,
