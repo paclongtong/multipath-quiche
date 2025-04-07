@@ -3547,6 +3547,10 @@ impl Connection {
         self.send_on_path(out, None, None)
     }
 
+    pub fn send_separate(&mut self, out: &mut [u8], is_ack: bool) -> Result<(usize, SendInfo)> {
+        self.send_on_path_separate(out, None, None, Some(is_ack))
+    }
+
     /// Writes a single QUIC packet to be sent to the peer from the specified
     /// local address `from` to the destination address `to`.
     ///
@@ -5261,6 +5265,11 @@ impl Connection {
             _ => self.get_send_path_id(from, to)?,
         };
 
+        let is_ack = match (from, to) {
+            (Some(_f), Some(_t)) => self.is_lowest_latency_send_path(send_pid),
+            _ => true,
+        };
+
         let send_path = self.paths.get_mut(send_pid)?;
 
         // Update max datagram size to allow path MTU discovery probe to be sent.
@@ -5289,7 +5298,7 @@ impl Connection {
                 send_pid,
                 has_initial,
                 now,
-                is_ack,
+                Some(is_ack),
             ) {
                 Ok(v) => v,
 
@@ -10454,6 +10463,68 @@ impl Connection {
         Err(Error::InvalidState)
     }
 
+    /// Determines if the given (from, to) tuple represents the lowest‐latency
+    /// (active) path based on the connection’s current path statistics.
+    ///
+    /// This function traverses the available paths (without collecting them
+    /// into a list), finds the active path with the smallest RTT, and then compares
+    /// it to the provided `from` and `to` addresses. If both `from` and `to` are
+    /// provided, it returns true only if they match the lowest‐latency path;
+    /// if either is None, it defaults to true.
+    pub fn is_lowest_latency_path(
+        &self,
+        from: Option<std::net::SocketAddr>,
+        to: Option<std::net::SocketAddr>,
+    ) -> bool {
+        let mut lowest: Option<(std::net::SocketAddr, std::net::SocketAddr, std::time::Duration)> = None;
+
+        // Iterate over the connection's path stats without allocating an entire list.
+        for path1 in self.path_stats() {
+            // Skip paths that are closed.
+            if let PathState::Closed(_, _) = path1.state {
+                continue;
+            }
+            let rtt = path1.rtt;
+            lowest = match lowest {
+                Some((_, _, current_rtt)) if rtt < current_rtt => Some((path1.local_addr, path1.peer_addr, rtt)),
+                Some(current) => Some(current),
+                None => Some((path1.local_addr, path1.peer_addr, rtt)),
+            };
+        }
+
+        if let Some((lowest_local, lowest_peer, _)) = lowest {
+            match (from, to) {
+                (Some(f), Some(t)) => f == lowest_local && t == lowest_peer,
+                _ => true,
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Determines if the given pid of a path represents the lowest‐latency
+    /// (active) path based on the connection’s current path statistics.
+    pub fn is_lowest_latency_send_path(&self, send_pid: usize) -> bool {
+        let mut lowest: Option<(usize, std::time::Duration)> = None;
+        // Iterate over the connection's paths without allocating a full list.
+        for (pid, p) in self.paths.iter() {
+            // // Skip paths that are closed.
+            // if let crate::path::PathState::Closed(_, _) = p.state {
+            //     continue;
+            // }
+            let rtt = p.recovery.rtt();
+            lowest = match lowest {
+                Some((_, best_rtt)) if rtt < best_rtt => Some((pid, rtt)),
+                Some(current) => Some(current),
+                None => Some((pid, rtt)),
+            };
+        }
+        if let Some((lowest_pid, _)) = lowest {
+            send_pid == lowest_pid
+        } else {
+            false
+        }
+    }
     /// Sets the path with identifier 'path_id' to be active.
     fn set_active_path(
         &mut self, path_id: usize, now: time::Instant,
