@@ -543,6 +543,24 @@ fn main() {
             }
         }
 
+        use itertools::Itertools;
+        fn lowest_latency_scheduler_flagged(
+            conn: &quiche::Connection,
+        ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr, bool)> {
+            let sorted_paths: Vec<_> = conn
+                .path_stats()
+                .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
+                .sorted_by_key(|p| p.rtt)
+                .map(|p| (p.local_addr, p.peer_addr))
+                .collect();
+        
+            sorted_paths
+                .into_iter()
+                .enumerate()
+                .map(|(i, (laddr, paddr))| (laddr, paddr, i == 0))
+        }
+
+
         // Generate outgoing QUIC packets for all active connections and send
         // them on the UDP socket, until quiche reports that there are no more
         // packets to be sent.
@@ -565,16 +583,39 @@ fn main() {
                     client.max_datagram_size;
             let mut total_write = 0;
             let mut dst_info: Option<quiche::SendInfo> = None;
+            // let mut is_ack: bool = false;
 
             while total_write < max_send_burst {
+                
+                let scheduled: Vec<_> = lowest_latency_scheduler_flagged(&client.conn).collect();
+                if scheduled.is_empty() {
+                    // No active paths available; nothing to send.
+                    break;
+                }
+                let (lowest_local, lowest_peer, _) = scheduled[0];
+                // Determine the is_ack flag based on the currently selected path.
+                // If dst_info is already set, check if its from/to match the lowest latency candidate.
+                // If dst_info is not yet set, default to true (using the lowest latency candidate).
+                let is_ack = match dst_info {
+                    Some(info) => {
+                        if info.from == lowest_local && info.to == lowest_peer {
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    None => true,
+                };
+
                 let res = match dst_info {
-                    Some(info) => client.conn.send_on_path(
+                    Some(info) => client.conn.send_on_path_separate(
                         &mut out[total_write..max_send_burst],
                         Some(info.from),
                         Some(info.to),
+                        Some(is_ack)
                     ),
                     None =>
-                        client.conn.send(&mut out[total_write..max_send_burst]),
+                        client.conn.send_separate(&mut out[total_write..max_send_burst], is_ack),
                 };
 
                 let (write, send_info) = match res {
