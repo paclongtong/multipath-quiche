@@ -544,20 +544,30 @@ fn main() {
         }
 
         use itertools::Itertools;
+        // fn lowest_latency_scheduler_flagged(
+        //     conn: &quiche::Connection,
+        // ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr, bool)> {
+        //     let sorted_paths: Vec<_> = conn
+        //         .path_stats()
+        //         .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
+        //         .sorted_by_key(|p| p.rtt)
+        //         .map(|p| (p.local_addr, p.peer_addr))
+        //         .collect();
+        
+        //     sorted_paths
+        //         .into_iter()
+        //         .enumerate()
+        //         .map(|(i, (laddr, paddr))| (laddr, paddr, i == 0))
+        // }
+
         fn lowest_latency_scheduler_flagged(
             conn: &quiche::Connection,
         ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr, bool)> {
-            let sorted_paths: Vec<_> = conn
-                .path_stats()
+            conn.path_stats()
                 .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
                 .sorted_by_key(|p| p.rtt)
-                .map(|p| (p.local_addr, p.peer_addr))
-                .collect();
-        
-            sorted_paths
-                .into_iter()
                 .enumerate()
-                .map(|(i, (laddr, paddr))| (laddr, paddr, i == 0))
+                .map(|(i, p)| (p.local_addr, p.peer_addr, i == 0))
         }
 
 
@@ -587,62 +597,47 @@ fn main() {
 
             while total_write < max_send_burst {
                 
-                let scheduled: Vec<_> = lowest_latency_scheduler_flagged(&client.conn).collect();
-                if scheduled.is_empty() {
+                let scheduled_tuples = lowest_latency_scheduler_flagged(&client.conn).collect::<Vec<_>>();
+                if scheduled_tuples.is_empty() {
                     // No active paths available; nothing to send.
                     break;
                 }
-                let (lowest_local, lowest_peer, _) = scheduled[0];
-                // Determine the is_ack flag based on the currently selected path.
-                // If dst_info is already set, check if its from/to match the lowest latency candidate.
-                // If dst_info is not yet set, default to true (using the lowest latency candidate).
-                let is_ack = match dst_info {
-                    Some(info) => {
-                        if info.from == lowest_local && info.to == lowest_peer {
-                            true
-                        } else {
-                            false
+                let mut packet_sent = false;
+
+                for (local_addr, peer_addr, is_low_latency) in scheduled_tuples {
+                    let is_ack = is_low_latency;
+                    loop{
+                        match client.conn.send_on_path_separate(
+                            &mut out[total_write..max_send_burst],
+                            Some(local_addr),
+                            Some(peer_addr),
+                            &mut Some(is_ack),
+                        ){
+                            Ok((write, send_info)) => {
+                                total_write += write;
+                                packet_sent = true;
+                                // Immediately set the dst_info
+                                let _ = dst_info.get_or_insert(send_info);
+            
+                                // If less than max_datagram_size, we've exhausted this round
+                                if write < client.max_datagram_size {
+                                    break;
+                                }
+                            }
+                            Err(quiche::Error::Done) => {
+                                break; // Move to next path
+                            }
+                            Err(e) => {
+                                error!("{} send failed: {:?}", client.conn.trace_id(), e);
+                                client.conn.close(false, 0x1, b"fail").ok();
+                                return;
+                            }
                         }
                     }
-                    None => true,
-                };
+                }
 
-                let res = match dst_info {
-                    Some(info) => client.conn.send_on_path_separate(
-                        &mut out[total_write..max_send_burst],
-                        Some(info.from),
-                        Some(info.to),
-                        Some(is_ack)
-                    ),
-                    None =>
-                        client.conn.send_separate(&mut out[total_write..max_send_burst], is_ack),
-                };
-
-                let (write, send_info) = match res {
-                    Ok(v) => v,
-
-                    Err(quiche::Error::Done) => {
-                        continue_write = dst_info.is_some();
-                        trace!("{} done writing", client.conn.trace_id());
-                        break;
-                    },
-
-                    Err(e) => {
-                        error!("{} send failed: {:?}", client.conn.trace_id(), e);
-
-                        client.conn.close(false, 0x1, b"fail").ok();
-                        break;
-                    },
-                };
-
-                total_write += write;
-
-                // Use the first packet time to send, not the last.
-                let _ = dst_info.get_or_insert(send_info);
-
-                if write < client.max_datagram_size {
-                    continue_write = true;
-                    break;
+                if !packet_sent {
+                    break; // No packets were sent; exit loop
                 }
             }
 
