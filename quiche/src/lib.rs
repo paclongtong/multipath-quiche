@@ -5265,10 +5265,10 @@ impl Connection {
             _ => self.get_send_path_id(from, to)?,
         };
 
-        let is_ack = match (from, to) {
-            (Some(_f), Some(_t)) => &mut self.is_lowest_latency_send_path(send_pid),
-            _ => is_ack,
-        };
+        // let is_ack = match (from, to) {
+        //     (Some(_f), Some(_t)) => &mut self.is_lowest_latency_send_path(send_pid),
+        //     _ => is_ack,
+        // };
 
         debug!("is_server:{}, send_pid:{}, from:{:?}, to{:?}, is_ack:{:?}", self.is_server, send_pid, from, to, is_ack);
         let send_path = self.paths.get_mut(send_pid)?;
