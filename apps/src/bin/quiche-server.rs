@@ -593,79 +593,44 @@ fn main() {
                     client.max_datagram_size;
             let mut total_write = 0;
             let mut dst_info: Option<quiche::SendInfo> = None;
-            // let mut is_ack: bool = false;
 
             while total_write < max_send_burst {
-                
-                let scheduled_tuples = lowest_latency_scheduler_flagged(&client.conn).collect::<Vec<_>>();
-                debug!("scheduled tuples:{:?}", scheduled_tuples);
-                if scheduled_tuples.is_empty() {
-                    // No active paths available; nothing to send.
-                    break;
-                }
-                let mut packet_sent = false;
-                if scheduled_tuples.len() == 1 {
-                    let (local_addr, peer_addr, _) = scheduled_tuples[0];
-                    loop {
-                        match client.conn.send_on_path(
-                            &mut out[total_write..max_send_burst],
-                            Some(local_addr),
-                            Some(peer_addr),
-                        ) {
-                            Ok((write, send_info)) => {
-                                total_write += write;
-                                packet_sent = true;
-                                dst_info.get_or_insert(send_info);
-                                if write < client.max_datagram_size {
-                                    break;
-                                }
-                            }
-                            Err(quiche::Error::Done) => break,
-                            Err(e) => {
-                                error!("send failed: {:?}", e);
-                                client.conn.close(false, 0x1, b"fail").ok();
-                                return;
-                            }
-                        }
-                    }
-                }
-                else {
-                    for (local_addr, peer_addr, is_low_latency) in scheduled_tuples {
-                        let is_ack = is_low_latency;
-                        loop{
-                            trace!("Attempting send: {} -> {}, is_ack: {}", local_addr, peer_addr, is_ack);
-                            match client.conn.send_on_path_separate(
-                                &mut out[total_write..max_send_burst],
-                                Some(local_addr),
-                                Some(peer_addr),
-                                &mut Some(is_ack),
-                            ){
-                                Ok((write, send_info)) => {
-                                    total_write += write;
-                                    packet_sent = true;
-                                    // Immediately set the dst_info
-                                    let _ = dst_info.get_or_insert(send_info);
-                
-                                    // If less than max_datagram_size, we've exhausted this round
-                                    if write < client.max_datagram_size {
-                                        break;
-                                    }
-                                }
-                                Err(quiche::Error::Done) => {
-                                    break; // Move to next path
-                                }
-                                Err(e) => {
-                                    error!("{} send failed: {:?}", client.conn.trace_id(), e);
-                                    client.conn.close(false, 0x1, b"fail").ok();
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
+                let res = match dst_info {
+                    Some(info) => client.conn.send_on_path_separate(
+                        &mut out[total_write..max_send_burst],
+                        Some(info.from),
+                        Some(info.to),
+                        Some(is_ack),
+                    ),
+                    None =>
+                        client.conn.send(&mut out[total_write..max_send_burst]),
+                };
 
-                if !packet_sent {
-                    break; // No packets were sent; exit loop
+                let (write, send_info) = match res {
+                    Ok(v) => v,
+
+                    Err(quiche::Error::Done) => {
+                        continue_write = dst_info.is_some();
+                        trace!("{} done writing", client.conn.trace_id());
+                        break;
+                    },
+
+                    Err(e) => {
+                        error!("{} send failed: {:?}", client.conn.trace_id(), e);
+
+                        client.conn.close(false, 0x1, b"fail").ok();
+                        break;
+                    },
+                };
+
+                total_write += write;
+
+                // Use the first packet time to send, not the last.
+                let _ = dst_info.get_or_insert(send_info);
+
+                if write < client.max_datagram_size {
+                    continue_write = true;
+                    break;
                 }
             }
 
