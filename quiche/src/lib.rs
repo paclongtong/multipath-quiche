@@ -3548,7 +3548,7 @@ impl Connection {
     }
 
     pub fn send_separate(&mut self, out: &mut [u8], is_ack: bool) -> Result<(usize, SendInfo)> {
-        self.send_on_path_separate(out, None, None, Some(is_ack))
+        self.send_on_path_separate(out, None, None, &mut Some(is_ack))
     }
 
     /// Writes a single QUIC packet to be sent to the peer from the specified
@@ -5218,7 +5218,7 @@ impl Connection {
     pub fn send_on_path_separate(
         &mut self, out: &mut [u8], from: Option<SocketAddr>,
         to: Option<SocketAddr>,
-        is_ack: Option<bool>,
+        is_ack: &mut Option<bool>,
     ) -> Result<(usize, SendInfo)> {
         if out.is_empty() {
             return Err(Error::BufferTooShort);
@@ -5266,10 +5266,11 @@ impl Connection {
         };
 
         let is_ack = match (from, to) {
-            (Some(_f), Some(_t)) => self.is_lowest_latency_send_path(send_pid),
-            _ => true,
+            (Some(_f), Some(_t)) => &mut self.is_lowest_latency_send_path(send_pid),
+            _ => is_ack,
         };
 
+        debug!("is_server:{}, send_pid:{}, from:{:?}, to{:?}, is_ack:{:?}", self.is_server, send_pid, from, to, is_ack);
         let send_path = self.paths.get_mut(send_pid)?;
 
         // Update max datagram size to allow path MTU discovery probe to be sent.
@@ -5298,7 +5299,7 @@ impl Connection {
                 send_pid,
                 has_initial,
                 now,
-                Some(is_ack),
+                is_ack,
             ) {
                 Ok(v) => v,
 
@@ -5368,7 +5369,7 @@ impl Connection {
     fn send_single_separate(
         &mut self, out: &mut [u8], send_pid: usize, has_initial: bool,
         now: time::Instant,
-        is_ack: Option<bool>,
+        is_ack: &mut Option<bool>,
     ) -> Result<(packet::Type, usize)> {
         if out.is_empty() {
             return Err(Error::BufferTooShort);
@@ -10504,7 +10505,7 @@ impl Connection {
 
     /// Determines if the given pid of a path represents the lowest‐latency
     /// (active) path based on the connection’s current path statistics.
-    pub fn is_lowest_latency_send_path(&self, send_pid: usize) -> bool {
+    pub fn is_lowest_latency_send_path(&self, send_pid: usize) -> Option<bool> {
         let mut lowest: Option<(usize, std::time::Duration)> = None;
         // Iterate over the connection's paths without allocating a full list.
         for (pid, p) in self.paths.iter() {
@@ -10520,9 +10521,9 @@ impl Connection {
             };
         }
         if let Some((lowest_pid, _)) = lowest {
-            send_pid == lowest_pid
+            Some(send_pid == lowest_pid)
         } else {
-            false
+            Some(false)
         }
     }
     /// Sets the path with identifier 'path_id' to be active.

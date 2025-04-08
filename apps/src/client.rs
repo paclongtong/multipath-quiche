@@ -579,7 +579,7 @@ pub fn connect(
                     &mut out,
                     Some(local_addr),
                     Some(peer_addr),
-                    Some(is_ack)
+                    &mut Some(is_ack)
                 ) {
                     Ok(v) => v,
 
