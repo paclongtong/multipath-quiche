@@ -36,6 +36,7 @@ use std::rc::Rc;
 
 use std::cell::RefCell;
 
+use itertools::Itertools;
 use ring::rand::*;
 
 use slab::Slab;
@@ -566,58 +567,110 @@ pub fn connect(
 
         // Determine in which order we are going to iterate over paths.
         // let scheduled_tuples = lowest_latency_scheduler(&conn);
-        let scheduled_tuples = lowest_latency_scheduler_flagged(&conn);
-
+        let scheduled_tuples = lowest_latency_scheduler_flagged(&conn).collect::<Vec<_>>();
+        debug!("scheduled_tuples:{:?}", scheduled_tuples);
         // Generate outgoing QUIC packets and send them on the UDP socket, until
         // quiche reports that there are no more packets to be sent.
-        for (local_addr, peer_addr, is_low_latency) in scheduled_tuples {
-            let token = src_addr_to_token[&local_addr];
-            let socket = &sockets[token];
-            let is_ack = is_low_latency;
-            loop {
-                let (write, send_info) = match conn.send_on_path_separate(
-                    &mut out,
-                    Some(local_addr),
-                    Some(peer_addr),
-                    &mut Some(is_ack)
-                ) {
-                    Ok(v) => v,
 
-                    Err(quiche::Error::Done) => {
-                        trace!("{} -> {}: done writing", local_addr, peer_addr);
-                        break;
-                    },
+        if scheduled_tuples.len() == 1{
+            for (local_addr, peer_addr, _) in scheduled_tuples {
+                let token = src_addr_to_token[&local_addr];
+                let socket = &sockets[token];
+                loop {
+                    let (write, send_info) = match conn.send_on_path(
+                        &mut out,
+                        Some(local_addr),
+                        Some(peer_addr),
+                    ) {
+                        Ok(v) => v,
 
-                    Err(e) => {
-                        error!(
-                            "{} -> {}: send failed: {:?}",
-                            local_addr, peer_addr, e
-                        );
+                        Err(quiche::Error::Done) => {
+                            trace!("{} -> {}: done writing", local_addr, peer_addr);
+                            break;
+                        },
 
-                        conn.close(false, 0x1, b"fail").ok();
-                        break;
-                    },
-                };
+                        Err(e) => {
+                            error!(
+                                "{} -> {}: send failed: {:?}",
+                                local_addr, peer_addr, e
+                            );
 
-                if let Err(e) = socket.send_to(&out[..write], send_info.to) {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        trace!(
-                            "{} -> {}: send() would block",
-                            local_addr,
-                            send_info.to
-                        );
-                        break;
+                            conn.close(false, 0x1, b"fail").ok();
+                            break;
+                        },
+                    };
+
+                    if let Err(e) = socket.send_to(&out[..write], send_info.to) {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            trace!(
+                                "{} -> {}: send() would block",
+                                local_addr,
+                                send_info.to
+                            );
+                            break;
+                        }
+
+                        return Err(ClientError::Other(format!(
+                            "{} -> {}: send() failed: {:?}",
+                            local_addr, send_info.to, e
+                        )));
                     }
 
-                    return Err(ClientError::Other(format!(
-                        "{} -> {}: send() failed: {:?}",
-                        local_addr, send_info.to, e
-                    )));
+                    trace!("{} -> {}: written {}", local_addr, send_info.to, write);
                 }
-
-                trace!("{} -> {}: written {}", local_addr, send_info.to, write);
             }
         }
+        else{
+            for (local_addr, peer_addr, is_low_latency) in scheduled_tuples {
+                let token = src_addr_to_token[&local_addr];
+                let socket = &sockets[token];
+                let is_ack = is_low_latency;
+                loop {
+                    let (write, send_info) = match conn.send_on_path_separate(
+                        &mut out,
+                        Some(local_addr),
+                        Some(peer_addr),
+                        &mut Some(is_ack)
+                    ) {
+                        Ok(v) => v,
+
+                        Err(quiche::Error::Done) => {
+                            trace!("{} -> {}: done writing", local_addr, peer_addr);
+                            break;
+                        },
+
+                        Err(e) => {
+                            error!(
+                                "{} -> {}: send failed: {:?}",
+                                local_addr, peer_addr, e
+                            );
+
+                            conn.close(false, 0x1, b"fail").ok();
+                            break;
+                        },
+                    };
+
+                    if let Err(e) = socket.send_to(&out[..write], send_info.to) {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            trace!(
+                                "{} -> {}: send() would block",
+                                local_addr,
+                                send_info.to
+                            );
+                            break;
+                        }
+
+                        return Err(ClientError::Other(format!(
+                            "{} -> {}: send() failed: {:?}",
+                            local_addr, send_info.to, e
+                        )));
+                    }
+
+                    trace!("{} -> {}: written {}", local_addr, send_info.to, write);
+                }
+            }
+        }
+
 
         if conn.is_closed() {
             info!(
