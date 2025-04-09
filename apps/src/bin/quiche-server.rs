@@ -595,42 +595,77 @@ fn main() {
             let mut dst_info: Option<quiche::SendInfo> = None;
 
             while total_write < max_send_burst {
-                let res = match dst_info {
-                    Some(info) => client.conn.send_on_path_separate(
+                // Get all active paths sorted by latency
+                let scheduled_paths: Vec<_> = lowest_latency_scheduler_flagged(&client.conn).collect();
+                
+                if scheduled_paths.is_empty() {
+                    break; // No active paths
+                }
+
+                // Case 1: Only one path available, fallback to normal send_on_path()
+                if scheduled_paths.len() == 1 {
+                    let (local_addr, peer_addr, _) = scheduled_paths[0];
+
+                    let (write, send_info) = match client.conn.send_on_path(
                         &mut out[total_write..max_send_burst],
-                        Some(info.from),
-                        Some(info.to),
-                        Some(is_ack),
-                    ),
-                    None =>
-                        client.conn.send(&mut out[total_write..max_send_burst]),
-                };
+                        Some(local_addr),
+                        Some(peer_addr),
+                    ) {
+                        Ok(v) => v,
+                        Err(quiche::Error::Done) => break,
+                        Err(e) => {
+                            error!("Send failed (single path): {:?}", e);
+                            client.conn.close(false, 0x1, b"fail").ok();
+                            break;
+                        }
+                    };
 
-                let (write, send_info) = match res {
-                    Ok(v) => v,
+                    total_write += write;
+                    dst_info.get_or_insert(send_info);
 
-                    Err(quiche::Error::Done) => {
-                        continue_write = dst_info.is_some();
-                        trace!("{} done writing", client.conn.trace_id());
+                    if write < client.max_datagram_size {
                         break;
-                    },
+                    }
+                } else {
+                    // Case 2: Multiple paths available, explicitly handle data-ack separation
+                    for (local_addr, peer_addr, is_low_latency) in scheduled_paths {
+                        let is_ack = is_low_latency; // lowest latency path for ACK packets
 
-                    Err(e) => {
-                        error!("{} send failed: {:?}", client.conn.trace_id(), e);
+                        // Keep sending until done or blocked
+                        loop {
+                            let res = client.conn.send_on_path_separate(
+                                &mut out[total_write..max_send_burst],
+                                Some(local_addr),
+                                Some(peer_addr),
+                                &mut Some(is_ack),
+                            );
 
-                        client.conn.close(false, 0x1, b"fail").ok();
-                        break;
-                    },
-                };
+                            let (write, send_info) = match res {
+                                Ok(v) => v,
+                                Err(quiche::Error::Done) => break, // Nothing more for this path
+                                Err(e) => {
+                                    error!("Send failed (multi-path): {:?}", e);
+                                    client.conn.close(false, 0x1, b"fail").ok();
+                                    break;
+                                }
+                            };
 
-                total_write += write;
+                            total_write += write;
+                            dst_info.get_or_insert(send_info);
 
-                // Use the first packet time to send, not the last.
-                let _ = dst_info.get_or_insert(send_info);
+                            if write < client.max_datagram_size {
+                                break;
+                            }
 
-                if write < client.max_datagram_size {
-                    continue_write = true;
-                    break;
+                            if total_write >= max_send_burst {
+                                break;
+                            }
+                        }
+
+                        if total_write >= max_send_burst {
+                            break; // Max burst reached, exit loop
+                        }
+                    }
                 }
             }
 
@@ -656,19 +691,6 @@ fn main() {
 
             trace!("{} written {} bytes", client.conn.trace_id(), total_write);
 
-            if continue_write {
-                trace!(
-                    "{} pause writing and consider another path",
-                    client.conn.trace_id()
-                );
-                break;
-            }
-
-            if total_write >= max_send_burst {
-                trace!("{} pause writing", client.conn.trace_id(),);
-                continue_write = true;
-                break;
-            }
         }
 
         // Garbage collect closed connections.
