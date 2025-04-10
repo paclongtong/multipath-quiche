@@ -10516,6 +10516,7 @@ impl Connection {
                         .max_by_key(|(_, p)| p.recovery.delivery_rate())
                         .map(|(pid, _)| pid)
                 };
+                debug!("get_send_path_id_separate(): is_ack:{}, maybe_pid:{}, delivery_rate:{}", is_ack.unwrap(), maybe_pid.unwrap(), self.paths.get(maybe_pid.unwrap()).unwrap().recovery.delivery_rate());
 
                 if let Some(pid) = maybe_pid {
                     return Ok(pid);

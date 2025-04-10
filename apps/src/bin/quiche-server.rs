@@ -41,6 +41,7 @@ use std::rc::Rc;
 
 use std::cell::RefCell;
 
+use libc::INOTIFY_MAX_USER_INSTANCES;
 use libc::NFT_BREAK;
 use ring::rand::*;
 
@@ -596,6 +597,7 @@ fn main() {
                 client.conn.send_quantum().min(client.max_send_burst) /
                     client.max_datagram_size *
                     client.max_datagram_size;
+            let mut max_send_burst_mut = max_send_burst.clone();
             let mut total_write = 0;
             let mut dst_info: Option<quiche::SendInfo> = None;
             // Get all active paths sorted by latency
@@ -676,85 +678,92 @@ fn main() {
                 }
             } else {
                 // for (local_addr, peer_addr, is_low_latency) in &scheduled_paths {
-                    while total_write < max_send_burst {
-                        debug!("entered the else loop. Scheduled tuples:{:?}", scheduled_paths);
-                        // Case 2: Multiple paths available, explicitly handle data-ack separation
-                    
-                        // let is_ack = is_low_latency; // lowest latency path for ACK packets
+                if burst_ack{ 
+                    max_send_burst_mut = max_send_burst/3
+                }else{
+                    max_send_burst_mut = max_send_burst
+                }
 
-                        // Keep sending until done or blocked
+                while total_write < max_send_burst_mut {
+                    debug!("entered the else loop. Scheduled tuples:{:?}", scheduled_paths);
+                    // Case 2: Multiple paths available, explicitly handle data-ack separation
+                
+                    // let is_ack = is_low_latency; // lowest latency path for ACK packets
 
-                        // let res = client.conn.send_on_path_separate(
-                        //     &mut out[total_write..max_send_burst],
-                        //     Some(*local_addr),
-                        //     Some(*peer_addr),
-                        //     &mut Some(*is_ack),
-                        // );
+                    // Keep sending until done or blocked
 
-                        let res = match dst_info {
-                            Some(info) => client.conn.send_on_path_separate(
-                                &mut out[total_write..max_send_burst],
-                                Some(info.from),
-                                Some(info.to),
-                                &mut Some(burst_ack),
-                            ),
-                            None => 
-                                client.conn.send_separate(&mut out[total_write..max_send_burst], burst_ack),
-                        };
+                    // let res = client.conn.send_on_path_separate(
+                    //     &mut out[total_write..max_send_burst],
+                    //     Some(*local_addr),
+                    //     Some(*peer_addr),
+                    //     &mut Some(*is_ack),
+                    // );
 
-                        let (write, send_info) = match res {
-                            Ok(v) => v,
-                            Err(quiche::Error::Done) => {
-                                continue_write = dst_info.is_some();
-                                break;
-                            }, // Nothing more for this path
-                            Err(e) => {
-                                error!("Send failed (multi-path): {:?}", e);
-                                client.conn.close(false, 0x1, b"fail").ok();
-                                break;
-                            }
-                        };
+                    let res = match dst_info {
+                        Some(info) => client.conn.send_on_path_separate(
+                            &mut out[total_write..max_send_burst],
+                            Some(info.from),
+                            Some(info.to),
+                            &mut Some(burst_ack),
+                        ),
+                        None => 
+                            client.conn.send_separate(&mut out[total_write..max_send_burst], burst_ack),
+                    };
 
-                        total_write += write;
-                        dst_info.get_or_insert(send_info);
-
-                        if write < client.max_datagram_size {
-                            continue_write = true;
+                    let (write, send_info) = match res {
+                        Ok(v) => v,
+                        Err(quiche::Error::Done) => {
+                            continue_write = dst_info.is_some();
+                            break;
+                        }, // Nothing more for this path
+                        Err(e) => {
+                            error!("Send failed (multi-path): {:?}", e);
+                            client.conn.close(false, 0x1, b"fail").ok();
                             break;
                         }
-                        
-                    }
-                    if total_write == 0 || dst_info.is_none() {
-                        continue;
-                    }
-                    debug!("sending packets with dst_info {:?}", &dst_info.unwrap());
-                    if let Err(e) = send_to(
-                        &socket,
-                        &out[..total_write],
-                        &dst_info.unwrap(),
-                        client.max_datagram_size,
-                        pacing,
-                        enable_gso,
-                    ){
-                        if e.kind() == std::io::ErrorKind::WouldBlock {
-                            trace!("send() would block");
-                            break;
-                        }
-        
-                        panic!("send_to() failed: {:?}", e);
-                    }
-                    if continue_write {
-                        trace!(
-                            "{} pause writing and consider another path",
-                            client.conn.trace_id()
-                        );
+                    };
+
+                    total_write += write;
+                    dst_info.get_or_insert(send_info);
+
+                    if write < client.max_datagram_size {
+                        continue_write = true;
                         break;
                     }
-                    if total_write >= max_send_burst {
-                        trace!("{} pause writing", client.conn.trace_id(),);
-                        continue_write = true;
-                        break; // Max burst reached, exit loop
+                    
+                }
+                debug!("+--total_write:{}, dst_info:{:?}, burst_ack:{}", total_write, dst_info, burst_ack);
+                if total_write == 0 || dst_info.is_none() {
+                    continue;
+                }
+                // debug!("sending packets with dst_info {:?}", &dst_info.unwrap());
+                if let Err(e) = send_to(
+                    &socket,
+                    &out[..total_write],
+                    &dst_info.unwrap(),
+                    client.max_datagram_size,
+                    pacing,
+                    enable_gso,
+                ){
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        trace!("send() would block");
+                        break;
                     }
+    
+                    panic!("send_to() failed: {:?}", e);
+                }
+                if continue_write {
+                    trace!(
+                        "{} pause writing and consider another path",
+                        client.conn.trace_id()
+                    );
+                    break;
+                }
+                if total_write >= max_send_burst {
+                    trace!("{} pause writing", client.conn.trace_id(),);
+                    continue_write = true;
+                    break; // Max burst reached, exit loop
+                }
                 // }
 
                     
