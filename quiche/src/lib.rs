@@ -5262,7 +5262,7 @@ impl Connection {
                 .path_id_from_addrs(&(f, t))
                 .ok_or(Error::InvalidState)?,
 
-            _ => self.get_send_path_id(from, to)?,
+            _ => self.get_send_path_id_separate(from, to, is_ack)?,
         };
 
         // let is_ack = match (from, to) {
@@ -10463,6 +10463,102 @@ impl Connection {
 
         Err(Error::InvalidState)
     }
+
+    /// Selects the path on which the next packet must be sent.
+    fn get_send_path_id_separate(
+        &self,
+        from: Option<SocketAddr>,
+        to: Option<SocketAddr>,
+        is_ack: &mut Option<bool>,
+    ) -> Result<usize> {
+        // A probing packet must be sent, but only if the connection is fully established.
+        if self.is_established() {
+            let mut probing = self
+                .paths
+                .iter()
+                .filter(|(_, p)| from.is_none() || Some(p.local_addr()) == from)
+                .filter(|(_, p)| to.is_none() || Some(p.peer_addr()) == to)
+                .filter(|(_, p)| p.active_dcid_seq.is_some())
+                .filter(|(_, p)| p.probing_required())
+                .map(|(pid, _)| pid);
+
+            if let Some(pid) = probing.next() {
+                return Ok(pid);
+            }
+        }
+
+        let mut consider_standby = false;
+        let dgrams_to_emit = self.dgram_send_queue.has_pending();
+        let stream_to_emit = self.streams.has_flushable();
+        // When using aggregate mode, favour lowest-latency path on which CWIN is open.
+        // This should only be used when data need to be sent.
+        // If we have standby paths, we may run the loop a second time.
+        if self.paths.multipath() && (dgrams_to_emit || stream_to_emit) {
+            // We loop at most twice.
+            loop {
+                let available_paths = self.paths.iter().filter(|(_, p)| {
+                    // Follow the filter provided as parameters.
+                    let local = from.map(|f| f == p.local_addr()).unwrap_or(true);
+                    let peer = to.map(|t| t == p.peer_addr()).unwrap_or(true);
+                    // Favour non-standby paths first, only consider active ones with open CWND.
+                    local && peer && (consider_standby || !p.is_standby()) && p.active()
+                        && p.recovery.cwnd_available() > 0
+                });
+
+                let maybe_pid = if is_ack.unwrap() {
+                    // For ACK packets, select the path with the lowest RTT.
+                    available_paths
+                        .min_by_key(|(_, p)| p.recovery.rtt())
+                        .map(|(pid, _)| pid)
+                } else {
+                    // Otherwise, select the path with the highest delivery rate (bandwidth).
+                    available_paths
+                        .max_by_key(|(_, p)| p.recovery.delivery_rate())
+                        .map(|(pid, _)| pid)
+                };
+
+                if let Some(pid) = maybe_pid {
+                    return Ok(pid);
+                }
+                if consider_standby || !self.paths.consider_standby_paths() {
+                    break;
+                }
+                consider_standby = true;
+            }
+        }
+
+        // When using multiple packet number spaces, let's force MP_ACK sending on their corresponding paths.
+        if self.is_multipath_enabled() {
+            if let Some(pid) = self
+                .pkt_num_spaces
+                .spaces
+                .application_data_space_ids()
+                .find_map(|path_id| {
+                    self.pkt_num_spaces
+                        .is_ready(packet::Epoch::Application, Some(path_id))
+                        .then(|| self.paths.pid_from_path_id(path_id))
+                        .flatten()
+                })
+            {
+                return Ok(pid);
+            }
+        }
+
+        if let Some((pid, p)) = self.paths.get_active_with_pid() {
+            if from.is_some() && Some(p.local_addr()) != from {
+                return Err(Error::Done);
+            }
+
+            if to.is_some() && Some(p.peer_addr()) != to {
+                return Err(Error::Done);
+            }
+
+            return Ok(pid);
+        }
+
+        Err(Error::InvalidState)
+    }
+
 
     /// Determines if the given (from, to) tuple represents the lowest‐latency
     /// (active) path based on the connection’s current path statistics.

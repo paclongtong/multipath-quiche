@@ -41,6 +41,7 @@ use std::rc::Rc;
 
 use std::cell::RefCell;
 
+use libc::NFT_BREAK;
 use ring::rand::*;
 
 use quiche_apps::args::*;
@@ -56,6 +57,8 @@ const MAX_DATAGRAM_SIZE: usize = 1350;
 fn main() {
     let mut buf = [0; MAX_BUF_SIZE];
     let mut out = [0; MAX_BUF_SIZE];
+    let mut data_out = [0; MAX_BUF_SIZE];
+    let mut ack_out = [0; MAX_BUF_SIZE];
     let mut pacing = false;
 
     env_logger::builder().format_timestamp_nanos().init();
@@ -179,6 +182,7 @@ fn main() {
     let mut continue_write = false;
 
     let local_addr = socket.local_addr().unwrap();
+    let mut burst_ack: bool = true;
 
     loop {
         // Find the shorter timeout from all the active connections.
@@ -544,37 +548,38 @@ fn main() {
         }
 
         use itertools::Itertools;
-        // fn lowest_latency_scheduler_flagged(
-        //     conn: &quiche::Connection,
-        // ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr, bool)> {
-        //     let sorted_paths: Vec<_> = conn
-        //         .path_stats()
-        //         .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
-        //         .sorted_by_key(|p| p.rtt)
-        //         .map(|p| (p.local_addr, p.peer_addr))
-        //         .collect();
-        
-        //     sorted_paths
-        //         .into_iter()
-        //         .enumerate()
-        //         .map(|(i, (laddr, paddr))| (laddr, paddr, i == 0))
-        // }
-
         fn lowest_latency_scheduler_flagged(
             conn: &quiche::Connection,
         ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr, bool)> {
-            conn.path_stats()
+            let sorted_paths: Vec<_> = conn
+                .path_stats()
                 .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
                 .sorted_by_key(|p| p.rtt)
+                .map(|p| (p.local_addr, p.peer_addr))
+                .collect();
+        
+            sorted_paths
+                .into_iter()
                 .enumerate()
-                .map(|(i, p)| (p.local_addr, p.peer_addr, i == 0))
+                .map(|(i, (laddr, paddr))| (laddr, paddr, i == 0))
         }
+
+        // fn lowest_latency_scheduler_flagged(
+        //     conn: &quiche::Connection,
+        // ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr, bool)> {
+        //     conn.path_stats()
+        //         .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
+        //         .sorted_by_key(|p| p.rtt)
+        //         .enumerate()
+        //         .map(|(i, p)| (p.local_addr, p.peer_addr, i == 0))
+        // }
 
 
         // Generate outgoing QUIC packets for all active connections and send
         // them on the UDP socket, until quiche reports that there are no more
         // packets to be sent.
         continue_write = false;
+        burst_ack = !burst_ack;
         for client in clients.values_mut() {
             // Reduce max_send_burst by 25% if loss is increasing more than 0.1%.
             let loss_rate =
@@ -593,26 +598,34 @@ fn main() {
                     client.max_datagram_size;
             let mut total_write = 0;
             let mut dst_info: Option<quiche::SendInfo> = None;
+            // Get all active paths sorted by latency
+            let scheduled_paths: Vec<_> = lowest_latency_scheduler_flagged(&client.conn).collect();
+            debug!("scheduled_paths:{:?}, length:{}", scheduled_paths, scheduled_paths.len());
+            if scheduled_paths.is_empty() {
+                break; // No active paths
+            }
+            if scheduled_paths.len() == 1 {
+                while total_write < max_send_burst {
+                    // Case 1: Only one path available, fallback to normal send_on_path()
+                    debug!("in the if loop");
+                    // let (local_addr, peer_addr, _) = scheduled_paths[0];
+                    let res = match dst_info {
+                        Some(info) => client.conn.send_on_path(
+                            &mut out[total_write..max_send_burst],
+                            Some(info.from),
+                            Some(info.to),
+                        ),
+                        None =>
+                            client.conn.send(&mut out[total_write..max_send_burst]),
+                    };
 
-            while total_write < max_send_burst {
-                // Get all active paths sorted by latency
-                let scheduled_paths: Vec<_> = lowest_latency_scheduler_flagged(&client.conn).collect();
-                
-                if scheduled_paths.is_empty() {
-                    break; // No active paths
-                }
-
-                // Case 1: Only one path available, fallback to normal send_on_path()
-                if scheduled_paths.len() == 1 {
-                    let (local_addr, peer_addr, _) = scheduled_paths[0];
-
-                    let (write, send_info) = match client.conn.send_on_path(
-                        &mut out[total_write..max_send_burst],
-                        Some(local_addr),
-                        Some(peer_addr),
-                    ) {
+                    let (write, send_info) = match res {
                         Ok(v) => v,
-                        Err(quiche::Error::Done) => break,
+                        Err(quiche::Error::Done) => {
+                            continue_write = dst_info.is_some();
+                            trace!("{} done writing", client.conn.trace_id());
+                            break;
+                        },
                         Err(e) => {
                             error!("Send failed (single path): {:?}", e);
                             client.conn.close(false, 0x1, b"fail").ok();
@@ -621,77 +634,153 @@ fn main() {
                     };
 
                     total_write += write;
-                    dst_info.get_or_insert(send_info);
+                    let _ = dst_info.get_or_insert(send_info);
 
                     if write < client.max_datagram_size {
+                        continue_write = true;
                         break;
                     }
-                } else {
-                    // Case 2: Multiple paths available, explicitly handle data-ack separation
-                    for (local_addr, peer_addr, is_low_latency) in scheduled_paths {
-                        let is_ack = is_low_latency; // lowest latency path for ACK packets
-
-                        // Keep sending until done or blocked
-                        loop {
-                            let res = client.conn.send_on_path_separate(
-                                &mut out[total_write..max_send_burst],
-                                Some(local_addr),
-                                Some(peer_addr),
-                                &mut Some(is_ack),
-                            );
-
-                            let (write, send_info) = match res {
-                                Ok(v) => v,
-                                Err(quiche::Error::Done) => break, // Nothing more for this path
-                                Err(e) => {
-                                    error!("Send failed (multi-path): {:?}", e);
-                                    client.conn.close(false, 0x1, b"fail").ok();
-                                    break;
-                                }
-                            };
-
-                            total_write += write;
-                            dst_info.get_or_insert(send_info);
-
-                            if write < client.max_datagram_size {
-                                break;
-                            }
-
-                            if total_write >= max_send_burst {
-                                break;
-                            }
-                        }
-
-                        if total_write >= max_send_burst {
-                            break; // Max burst reached, exit loop
-                        }
-                    }
                 }
-            }
-
-            if total_write == 0 || dst_info.is_none() {
-                continue;
-            }
-
-            if let Err(e) = send_to(
-                &socket,
-                &out[..total_write],
-                &dst_info.unwrap(),
-                client.max_datagram_size,
-                pacing,
-                enable_gso,
-            ) {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    trace!("send() would block");
+                debug!("--total_write:{}, dst_info:{:?}", total_write, dst_info);
+                if total_write == 0 || dst_info.is_none() {
+                    continue;
+                }
+                debug!("*sending packets with dst_info {:?}", &dst_info.unwrap());
+                if let Err(e) = send_to(
+                    &socket,
+                    &out[..total_write],
+                    &dst_info.unwrap(),
+                    client.max_datagram_size,
+                    pacing,
+                    enable_gso,
+                )
+                {
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        trace!("send() would block");
+                        break;
+                    }
+    
+                    panic!("send_to() failed: {:?}", e);
+                }
+                if continue_write {
+                    trace!(
+                        "{} pause writing and consider another path",
+                        client.conn.trace_id()
+                    );
                     break;
                 }
+                if total_write >= max_send_burst {
+                    trace!("{} pause writing", client.conn.trace_id(),);
+                    continue_write = true;
+                    break; // Max burst reached, exit loop
+                }
+            } else {
+                // for (local_addr, peer_addr, is_low_latency) in &scheduled_paths {
+                    while total_write < max_send_burst {
+                        debug!("entered the else loop. Scheduled tuples:{:?}", scheduled_paths);
+                        // Case 2: Multiple paths available, explicitly handle data-ack separation
+                    
+                        // let is_ack = is_low_latency; // lowest latency path for ACK packets
 
-                panic!("send_to() failed: {:?}", e);
+                        // Keep sending until done or blocked
+
+                        // let res = client.conn.send_on_path_separate(
+                        //     &mut out[total_write..max_send_burst],
+                        //     Some(*local_addr),
+                        //     Some(*peer_addr),
+                        //     &mut Some(*is_ack),
+                        // );
+
+                        let res = match dst_info {
+                            Some(info) => client.conn.send_on_path_separate(
+                                &mut out[total_write..max_send_burst],
+                                Some(info.from),
+                                Some(info.to),
+                                &mut Some(burst_ack),
+                            ),
+                            None => 
+                                client.conn.send_separate(&mut out[total_write..max_send_burst], burst_ack),
+                        };
+
+                        let (write, send_info) = match res {
+                            Ok(v) => v,
+                            Err(quiche::Error::Done) => {
+                                continue_write = dst_info.is_some();
+                                break;
+                            }, // Nothing more for this path
+                            Err(e) => {
+                                error!("Send failed (multi-path): {:?}", e);
+                                client.conn.close(false, 0x1, b"fail").ok();
+                                break;
+                            }
+                        };
+
+                        total_write += write;
+                        dst_info.get_or_insert(send_info);
+
+                        if write < client.max_datagram_size {
+                            continue_write = true;
+                            break;
+                        }
+                        
+                    }
+                    if total_write == 0 || dst_info.is_none() {
+                        continue;
+                    }
+                    debug!("sending packets with dst_info {:?}", &dst_info.unwrap());
+                    if let Err(e) = send_to(
+                        &socket,
+                        &out[..total_write],
+                        &dst_info.unwrap(),
+                        client.max_datagram_size,
+                        pacing,
+                        enable_gso,
+                    ){
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            trace!("send() would block");
+                            break;
+                        }
+        
+                        panic!("send_to() failed: {:?}", e);
+                    }
+                    if continue_write {
+                        trace!(
+                            "{} pause writing and consider another path",
+                            client.conn.trace_id()
+                        );
+                        break;
+                    }
+                    if total_write >= max_send_burst {
+                        trace!("{} pause writing", client.conn.trace_id(),);
+                        continue_write = true;
+                        break; // Max burst reached, exit loop
+                    }
+                // }
+
+                    
             }
-
             trace!("{} written {} bytes", client.conn.trace_id(), total_write);
-
         }
+
+            // if total_write == 0 || dst_info.is_none() {
+            //     continue;
+            // }
+
+            // if let Err(e) = send_to(
+            //     &socket,
+            //     &out[..total_write],
+            //     &dst_info.unwrap(),
+            //     client.max_datagram_size,
+            //     pacing,
+            //     enable_gso,
+            // ) {
+            //     if e.kind() == std::io::ErrorKind::WouldBlock {
+            //         trace!("send() would block");
+            //         break;
+            //     }
+
+            //     panic!("send_to() failed: {:?}", e);
+            // }
 
         // Garbage collect closed connections.
         clients.retain(|_, ref mut c| {
@@ -710,11 +799,11 @@ fn main() {
                     clients_ids.remove(&id_owned);
                 }
             }
-
             !c.conn.is_closed()
         });
     }
 }
+
 
 /// Generate a stateless retry token.
 ///
