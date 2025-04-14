@@ -446,6 +446,12 @@ impl Scheduler for HighBandwidthScheduler{
     }
 }
 
+enum PacketMode {
+    AckOnly,
+    DataOnly,
+    Auto,
+}
+
 pub struct LowLatencyScheduler;
 
 impl Scheduler for LowLatencyScheduler{
@@ -3547,8 +3553,8 @@ impl Connection {
         self.send_on_path(out, None, None)
     }
 
-    pub fn send_separate(&mut self, out: &mut [u8], is_ack: bool) -> Result<(usize, SendInfo)> {
-        self.send_on_path_separate(out, None, None, &mut Some(is_ack))
+    pub fn send_separate(&mut self, out: &mut [u8]) -> Result<(usize, SendInfo)> {
+        self.send_on_path_separate_server(out, None, None, &mut Some(true))
     }
 
     /// Writes a single QUIC packet to be sent to the peer from the specified
@@ -5366,6 +5372,158 @@ impl Connection {
         Ok((done, info))
     }
 
+    pub fn send_on_path_separate_server(
+        &mut self, out: &mut [u8], from: Option<SocketAddr>,
+        to: Option<SocketAddr>,
+        is_ack: &mut Option<bool>,
+    ) -> Result<(usize, SendInfo)> {
+        if out.is_empty() {
+            return Err(Error::BufferTooShort);
+        }
+
+        if self.is_closed() || self.is_draining() {
+            return Err(Error::Done);
+        }
+
+        let now = time::Instant::now();
+
+        if self.local_error.is_none() {
+            self.do_handshake(now)?;
+        }
+
+        // Forwarding the error value here could confuse
+        // applications, as they may not expect getting a `recv()`
+        // error when calling `send()`.
+        //
+        // We simply fall-through to sending packets, which should
+        // take care of terminating the connection as needed.
+        let _ = self.process_undecrypted_0rtt_packets();
+
+        // There's no point in trying to send a packet if the Initial secrets
+        // have not been derived yet, so return early.
+        if !self.derived_initial_secrets {
+            return Err(Error::Done);
+        }
+
+        let mut has_initial = false;
+
+        let mut done = 0;
+
+        // Limit output packet size to respect the sender and receiver's
+        // maximum UDP payload size limit.
+        let mut left = cmp::min(out.len(), self.max_send_udp_payload_size());
+
+        let send_pid = match (from, to) {
+            (Some(f), Some(t)) => self
+                .paths
+                .path_id_from_addrs(&(f, t))
+                .ok_or(Error::InvalidState)?,
+
+            _ => self.get_send_path_id_separate(from, to, is_ack)?,
+        };
+
+        // let is_ack = match (from, to) {
+        //     (Some(_f), Some(_t)) => &mut self.is_lowest_latency_send_path(send_pid),
+        //     _ => is_ack,
+        // };
+
+        debug!("is_server:{}, send_pid:{}, from:{:?}, to{:?}, is_ack:{:?}", self.is_server, send_pid, from, to, is_ack);
+        let send_path = self.paths.get_mut(send_pid)?;
+
+        // Update max datagram size to allow path MTU discovery probe to be sent.
+        if send_path.pmtud.get_probe_status() {
+            let size = if self.handshake_confirmed || self.handshake_done_sent {
+                send_path.pmtud.get_probe_size()
+            } else {
+                send_path.pmtud.get_current()
+            };
+
+            send_path.recovery.pmtud_update_max_datagram_size(size);
+
+            left = cmp::min(out.len(), send_path.recovery.max_datagram_size());
+        }
+
+        // Limit data sent by the server based on the amount of data received
+        // from the client before its address is validated.
+        if !send_path.verified_peer_address && self.is_server {
+            left = cmp::min(left, send_path.max_send_bytes);
+        }
+
+        // Generate coalesced packets.
+        while left > 0 {
+            let mut is_ack = &mut Some(!is_ack.unwrap());
+            let (ty, written) = match self.send_single_separate(
+                &mut out[done..done + left],
+                send_pid,
+                has_initial,
+                now,
+                &mut is_ack,
+            ) {
+                Ok(v) => v,
+
+                Err(Error::BufferTooShort) | Err(Error::Done) => break,
+
+                Err(e) => return Err(e),
+            };
+
+            done += written;
+            left -= written;
+
+            match ty {
+                packet::Type::Initial => has_initial = true,
+
+                // No more packets can be coalesced after a 1-RTT.
+                packet::Type::Short => break,
+
+                _ => (),
+            };
+
+            // When sending multiple PTO probes, don't coalesce them together,
+            // so they are sent on separate UDP datagrams.
+            if let Ok(epoch) = ty.to_epoch() {
+                if self.paths.get_mut(send_pid)?.recovery.loss_probes(epoch) > 0 {
+                    break;
+                }
+            }
+
+            // Don't coalesce packets that must go on different paths.
+            if !(from.is_some() && to.is_some()) &&
+                self.get_send_path_id(from, to)? != send_pid
+            {
+                break;
+            }
+        }
+
+        if done == 0 {
+            self.last_tx_data = self.tx_data;
+
+            return Err(Error::Done);
+        }
+
+        // Pad UDP datagram if it contains a QUIC Initial packet.
+        #[cfg(not(feature = "fuzzing"))]
+        if has_initial && left > 0 && done < MIN_CLIENT_INITIAL_LEN {
+            let pad_len = cmp::min(left, MIN_CLIENT_INITIAL_LEN - done);
+
+            // Fill padding area with null bytes, to avoid leaking information
+            // in case the application reuses the packet buffer.
+            out[done..done + pad_len].fill(0);
+
+            done += pad_len;
+        }
+
+        let send_path = self.paths.get(send_pid)?;
+
+        let info = SendInfo {
+            from: send_path.local_addr(),
+            to: send_path.peer_addr(),
+
+            at: send_path.recovery.get_packet_send_time(),
+        };
+
+        Ok((done, info))
+    }
+
     fn send_single_separate(
         &mut self, out: &mut [u8], send_pid: usize, has_initial: bool,
         now: time::Instant,
@@ -5398,7 +5556,7 @@ impl Connection {
         let multiple_application_data_pkt_num_spaces =
             self.use_path_pkt_num_space(epoch);
         
-        let ack_mode = is_ack.unwrap_or(false);
+        let mut ack_mode = &mut is_ack.unwrap_or(false);
 
         // Process lost frames. There might be several paths having lost frames.
         for (_, p) in self.paths.iter_mut() {
@@ -5753,7 +5911,7 @@ impl Connection {
             let mut wrote_ack_mp = false;
             let pns = self.pkt_num_spaces.spaces.get_mut(epoch, path_id)?;
             if pns.recv_pkt_need_ack.len() > 0 && 
-                (pns.ack_elicited || ack_elicit_required) && ack_mode
+                (pns.ack_elicited || ack_elicit_required) && *ack_mode
             {
                 let ack_delay = pns.largest_rx_pkt_time.elapsed();
 
@@ -5839,6 +5997,10 @@ impl Connection {
                             }
                         }
                     }
+                    // else {
+                    //     ack_mode = &mut false;
+                    //     debug!("No more packet to ack in some other path, reset ack_mode.")
+                    // }
                 }
             }
         }
@@ -6459,7 +6621,7 @@ impl Connection {
             path.active() &&
             !dgram_emitted &&
             (consider_standby_paths || !path.is_standby()) &&
-            !ack_mode
+            !*ack_mode
         {
             while let Some(priority_key) = self.streams.peek_flushable() {
                 let stream_id = priority_key.id;
@@ -6564,6 +6726,7 @@ impl Connection {
 
                 break;
             }
+            // Pending: Set the ack_mode to enable mp_ack sending when there is no more stream frames to send.
         }
 
         // Alternate trying to send DATAGRAMs next time.
@@ -10516,7 +10679,7 @@ impl Connection {
                         .max_by_key(|(_, p)| p.recovery.delivery_rate())
                         .map(|(pid, _)| pid)
                 };
-                debug!("get_send_path_id_separate(): is_ack:{}, maybe_pid:{}, delivery_rate:{}", is_ack.unwrap(), maybe_pid.unwrap(), self.paths.get(maybe_pid.unwrap()).unwrap().recovery.delivery_rate());
+                debug!("get_send_path_id_separate(): is_ack:{}, maybe_pid:{}, delivery_rate:{}, rtt:{:?}", is_ack.unwrap(), maybe_pid.unwrap(), self.paths.get(maybe_pid.unwrap()).unwrap().recovery.delivery_rate(), self.paths.get(maybe_pid.unwrap()).unwrap().recovery.rtt());
 
                 if let Some(pid) = maybe_pid {
                     return Ok(pid);
@@ -10816,6 +10979,13 @@ impl Connection {
         }
         self.closed = true;
     }
+
+    // fn pending_ack_units(&self) -> usize {
+    //     self.pkt_num_spaces
+    //         .spaces
+    //         .map(|space| space.recv_pkt_need_ack.len())
+    //         .sum()
+    // }
 
     // pub fn is_pkt_ack(&self) -> bool {
     //     // Initialize counter for the total number of pending ACK entries.
