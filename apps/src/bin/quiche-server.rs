@@ -597,6 +597,7 @@ fn main() {
                 client.conn.send_quantum().min(client.max_send_burst) /
                     client.max_datagram_size *
                     client.max_datagram_size;
+            debug!("send_quantum.min: {:?}", client.conn.send_quantum().min(client.max_send_burst));
             let mut max_send_burst_mut = max_send_burst.clone();
             let mut total_write = 0;
             let mut dst_info: Option<quiche::SendInfo> = None;
@@ -678,13 +679,13 @@ fn main() {
                 }
             } else {
                 // for (local_addr, peer_addr, is_low_latency) in &scheduled_paths {
-                if burst_ack{ 
-                    max_send_burst_mut = max_send_burst/3
-                }else{
-                    max_send_burst_mut = max_send_burst
-                }
+                // if burst_ack{ 
+                //     max_send_burst_mut = max_send_burst
+                // }else{
+                //     max_send_burst_mut = max_send_burst
+                // }
 
-                while total_write < max_send_burst_mut {
+                while total_write < max_send_burst {
                     debug!("entered the else loop. Scheduled tuples:{:?}", scheduled_paths);
                     // Case 2: Multiple paths available, explicitly handle data-ack separation
                 
@@ -706,8 +707,14 @@ fn main() {
                             Some(info.to),
                             &mut Some(burst_ack),
                         ),
+                        // Some(info) => client.conn.send_on_path(
+                        //     &mut out[total_write..max_send_burst],
+                        //     Some(info.from),
+                        //     Some(info.to),
+                        // ),
                         None => 
-                            client.conn.send_separate(&mut out[total_write..max_send_burst], burst_ack),
+                            client.conn.send_separate(&mut out[total_write..max_send_burst]),
+                            // client.conn.send(&mut out[total_write..max_send_burst]),
                     };
 
                     let (write, send_info) = match res {
@@ -763,10 +770,7 @@ fn main() {
                     trace!("{} pause writing", client.conn.trace_id(),);
                     continue_write = true;
                     break; // Max burst reached, exit loop
-                }
-                // }
-
-                    
+                }  
             }
             trace!("{} written {} bytes", client.conn.trace_id(), total_write);
         }
