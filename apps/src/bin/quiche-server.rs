@@ -701,7 +701,7 @@ fn main() {
                     // );
 
                     let res = match dst_info {
-                        Some(info) => client.conn.send_on_path_separate(
+                        Some(info) => client.conn.send_on_path_separate_server(
                             &mut out[total_write..max_send_burst],
                             Some(info.from),
                             Some(info.to),
