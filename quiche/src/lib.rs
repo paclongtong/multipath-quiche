@@ -12018,7 +12018,7 @@ impl Connection {
     }
 
     /// Selects the path on which the next packet must be sent.
-    fn get_send_path_id(
+    pub fn get_send_path_id(
         &self, from: Option<SocketAddr>, to: Option<SocketAddr>,
     ) -> Result<usize> {
         // A probing packet must be sent, but only if the connection is fully
@@ -12155,40 +12155,63 @@ impl Connection {
                         .max_by_key(|(_, p)| p.recovery.delivery_rate())
                         .map(|(pid, _)| pid)
                 };
-                if maybe_pid.is_none() {
-                    warn!("maybe_pid is None! is_ack: {}", is_ack.unwrap());
-                    let available_paths = self.paths.iter().filter(|(_, p)| {
-                        // Follow the filter provided as parameters.
-                        let local = from.map(|f| f == p.local_addr()).unwrap_or(true);
-                        let peer = to.map(|t| t == p.peer_addr()).unwrap_or(true);
-                        // Favour non-standby paths first, only consider active ones with open CWND.
-                        local && peer && (consider_standby || !p.is_standby()) && p.active()
-                            && p.recovery.cwnd_available() > 0
-                    });
-                    for (pid, p) in available_paths {
-                        debug!(
-                            "Path id: {}, delivery_rate: {}, rtt: {:?}",
-                            pid,
-                            p.recovery.delivery_rate(),
-                            p.recovery.rtt()
-                        );
-                    }
+                // 1) Snapshot all candidate paths & stats
+                let mut snapshot = Vec::with_capacity(self.paths.len());
+                for (pid, p) in self.paths.iter() {
+                    let local_ok = from.map_or(true, |f| f == p.local_addr());
+                    let peer_ok  = to  .map_or(true, |t| t == p.peer_addr());
+                    let active   = p.active_dcid_seq.is_some() && p.recovery.cwnd_available() > 0;
+                    snapshot.push((
+                        pid,
+                        p.local_addr(),
+                        p.peer_addr(),
+                        active,
+                        p.recovery.delivery_rate(),
+                        p.recovery.rtt(),
+                        p.is_standby(),
+                    ));
                 }
-                match maybe_pid {
-                    Some(pid) => {
-                        let path = self.paths.get(pid).unwrap(); // okay if you're sure pid is valid
-                        debug!(
-                            "get_send_path_id_separate(): is_ack:{}, maybe_pid:{}, delivery_rate:{}, rtt:{:?}",
-                            is_ack.unwrap(),
-                            pid,
-                            path.recovery.delivery_rate(),
-                            path.recovery.rtt()
-                        );
-                    }
-                    None => {
-                        warn!("maybe_pid was None — no available paths for {:?}", is_ack.unwrap());
-                    }
+                trace!(
+                    "path‐snapshot is_ack={:?}, dgrams={}, streams={}: {:?}",
+                    is_ack,
+                    dgrams_to_emit,
+                    stream_to_emit,
+                    snapshot,
+                );
+
+                let mut available_paths = self.paths.iter().filter(|(_, p)| {
+                    // Follow the filter provided as parameters.
+                    let local = from.map(|f| f == p.local_addr()).unwrap_or(true);
+                    let peer = to.map(|t| t == p.peer_addr()).unwrap_or(true);
+                    // Favour non-standby paths first, only consider active ones with open CWND.
+                    local && peer && (consider_standby || !p.is_standby()) && p.active()
+                        && p.recovery.cwnd_available() > 0
+                }).peekable();
+                debug!("Available paths is_none: {}", available_paths.peek().is_none());
+                for (pid, p) in available_paths {
+                    warn!(
+                        "Path id: {}, delivery_rate: {}, rtt: {:?}",
+                        pid,
+                        p.recovery.delivery_rate(),
+                        p.recovery.rtt()
+                    );
                 }
+
+                // match maybe_pid {
+                //     Some(pid) => {
+                //         let path = self.paths.get(pid).unwrap(); // okay if you're sure pid is valid
+                //         warn!(
+                //             "get_send_path_id_separate(): is_ack:{}, maybe_pid:{}, delivery_rate:{}, rtt:{:?}",
+                //             is_ack.unwrap(),
+                //             pid,
+                //             path.recovery.delivery_rate(),
+                //             path.recovery.rtt()
+                //         );
+                //     }
+                //     None => {
+                //         warn!("maybe_pid was None — no available paths for {:?}", is_ack.unwrap());
+                //     }
+                // }
 
                 if let Some(pid) = maybe_pid {
                     return Ok(pid);
@@ -12232,7 +12255,157 @@ impl Connection {
         Err(Error::InvalidState)
     }
 
-
+    fn get_send_path_id_separate1(
+        &self,
+        from: Option<SocketAddr>,
+        to: Option<SocketAddr>,
+        is_ack: &mut Option<bool>,
+    ) -> Result<usize> {
+        // 1) Probing has absolute priority:
+        if self.is_established() {
+            let mut probing = self
+                .paths
+                .iter()
+                .filter(|(_, p)| from.map_or(true, |f| f == p.local_addr()))
+                .filter(|(_, p)| to  .map_or(true, |t| t == p.peer_addr()))
+                .filter(|(_, p)| p.active_dcid_seq.is_some())
+                .filter(|(_, p)| p.probing_required())
+                .map(|(pid, _)| pid);
+    
+            if let Some(pid) = probing.next() {
+                info!("probing path id={} selected", pid);
+                return Ok(pid);
+            }
+        }
+    
+        // 2) Decide whether we have datagrams or streams to send:
+        let dgrams_to_emit = self.dgram_send_queue.has_pending();
+        let stream_to_emit = self.streams.has_flushable();
+    
+        // 3) Take a snapshot of all paths & stats for tracing:
+        let mut snapshot = Vec::with_capacity(self.paths.len());
+        for (pid, p) in self.paths.iter() {
+            snapshot.push((
+                pid,
+                p.local_addr(),
+                p.peer_addr(),
+                from.map_or(true, |f| f == p.local_addr()),
+                to  .map_or(true, |t| t == p.peer_addr()),
+                p.active_dcid_seq.is_some(),
+                p.recovery.cwnd_available(),
+                p.recovery.delivery_rate(),
+                p.recovery.rtt(),
+                p.is_standby(),
+            ));
+        }
+        trace!(
+            "path‑snapshot is_ack={:?}, dgrams={}, streams={}: {:?}",
+            is_ack,
+            dgrams_to_emit,
+            stream_to_emit,
+            snapshot
+        );
+        use crate::path::Path;
+        // 4) If multipath and there's real work (dgrams or streams), choose by is_ack:
+        if self.paths.multipath() && (dgrams_to_emit || stream_to_emit) {
+            let mut consider_standby = false;
+    
+            // We’ll try twice: first only non‑standby, then allow standby.
+            for _ in 0..2 {
+                // Build the list of “eligible” paths under current standby policy:
+                let mut available: Vec<(usize, &Path)> = self
+                    .paths
+                    .iter()
+                    .filter(|(_, p)| {
+                        let local_ok  = from.map_or(true, |f| f == p.local_addr());
+                        let peer_ok   = to  .map_or(true, |t| t == p.peer_addr());
+                        let cwnd_ok   = p.recovery.cwnd_available() > 0;
+                        local_ok
+                            && peer_ok
+                            && (consider_standby || !p.is_standby())
+                            && p.active()
+                            && cwnd_ok
+                    })
+                    .collect();
+    
+                // Log which paths survived filtering:
+                let avail_info: Vec<_> = available
+                    .iter()
+                    .map(|(pid, p)| {
+                        (
+                            *pid,
+                            p.recovery.cwnd_available(),
+                            p.recovery.delivery_rate(),
+                            p.recovery.rtt(),
+                            p.is_standby(),
+                        )
+                    })
+                    .collect();
+                debug!(
+                    "available paths (standby={}): {:?}",
+                    consider_standby, avail_info
+                );
+    
+                // Pick min RTT for ACKs or max rate for data:
+                let chosen = if is_ack.unwrap_or(false) {
+                    available
+                        .iter()
+                        .min_by_key(|(_, p)| p.recovery.rtt())
+                        .map(|(pid, _)| *pid)
+                } else {
+                    available
+                        .iter()
+                        .max_by_key(|(_, p)| p.recovery.delivery_rate())
+                        .map(|(pid, _)| *pid)
+                };
+    
+                if let Some(pid) = chosen {
+                    let p = self.paths.get(pid).unwrap();
+                    info!(
+                        "chosen pid={} for is_ack={:?}: cwnd={}, rate={}, rtt={:?}, standby={}",
+                        pid,
+                        is_ack.unwrap_or(false),
+                        p.recovery.cwnd_available(),
+                        p.recovery.delivery_rate(),
+                        p.recovery.rtt(),
+                        p.is_standby()
+                    );
+                    return Ok(pid);
+                }
+    
+                // If nothing matched, next iteration may allow standby:
+                consider_standby = consider_standby || self.paths.consider_standby_paths();
+                warn!(
+                    "no eligible path (is_ack={:?}), consider_standby now {}",
+                    is_ack.unwrap_or(false),
+                    consider_standby
+                );
+            }
+        }
+    
+        // 5) Final fallback: any path with non‑zero CWND
+        if let Some((pid, p)) = self
+            .paths
+            .iter()
+            .filter(|(_, p)| p.recovery.cwnd_available() > 0)
+            .next()
+        {
+            info!(
+                "fallback pid={} for is_ack={:?} (first path with CWND>0)",
+                pid,
+                is_ack.unwrap_or(false)
+            );
+            return Ok(pid);
+        }
+    
+        // 6) If we still have no path, that’s a state error:
+        error!(
+            "get_send_path_id_separate(): no usable path for is_ack={:?}",
+            is_ack.unwrap_or(false)
+        );
+        Err(Error::InvalidState)
+    }
+    
     /// Determines if the given (from, to) tuple represents the lowest‐latency
     /// (active) path based on the connection’s current path statistics.
     ///
