@@ -685,10 +685,14 @@ fn main() {
             } 
             else {
                 let mut bytes_left = client.conn.send_quantum().min(client.max_send_burst);
+                trace!("bytes left: {}", bytes_left);
                 for (local_addr, peer_addr, is_low_latency) in &scheduled_paths {
                     debug!("entered the else loop. Scheduled tuples:{:?}", scheduled_paths);
-                    loop{
-                        if bytes_left == 0 { break; }
+                    'inner: loop{
+                        if bytes_left == 0 { 
+                            continue_write = true;
+                            break 'inner;
+                        }
                         // Case 2: Multiple paths available, explicitly handle data-ack separation
                     
                         let is_ack = is_low_latency; // lowest latency path for ACK packets
@@ -707,12 +711,12 @@ fn main() {
                             Err(quiche::Error::Done) => {
                                 continue_write = dst_info.is_some();
                                 debug!("Err(quiche::Error::Done)");
-                                break;
+                                break 'inner;
                             }, // Nothing more for this path
                             Err(e) => {
                                 error!("Send failed (multi-path): {:?}", e);
                                 client.conn.close(false, 0x1, b"fail").ok();
-                                break;
+                                break 'inner;
                             }
                         };
 
@@ -734,7 +738,7 @@ fn main() {
                             ){
                                 if e.kind() == std::io::ErrorKind::WouldBlock {
                                     trace!("send() would block");
-                                    break;
+                                    break 'inner;
                                 }
                 
                                 panic!("send_to() failed: {:?}", e);
