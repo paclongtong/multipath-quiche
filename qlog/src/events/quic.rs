@@ -800,6 +800,7 @@ pub struct RecoveryParametersSet {
 #[serde_with::skip_serializing_none]
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct MetricsUpdated {
+    pub path_id: Option<u64>,
     pub min_rtt: Option<f32>,
     pub smoothed_rtt: Option<f32>,
     pub latest_rtt: Option<f32>,

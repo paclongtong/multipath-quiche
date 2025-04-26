@@ -181,7 +181,7 @@ pub enum PathEvent {
 /// A network path on which QUIC packets can be sent.
 pub struct Path {
     /// The explicit path ID in multipath.
-    path_id: PathId,
+    pub path_id: PathId,
 
     /// The local address.
     local_addr: SocketAddr,
@@ -250,7 +250,7 @@ pub struct Path {
     peer_abandoned: bool,
 
     /// The scheduling status of this path.
-    status: PathStatus,
+    pub status: PathStatus,
 
     /// Total number of bytes the server can send before the peer's address
     /// is verified.
@@ -294,6 +294,9 @@ impl Path {
             (PathValidationState::Unknown, None, None)
         };
 
+        let mut r = recovery::Recovery::new_with_config(recovery_config);
+        r.path_id = path_id as u64;
+
         Self {
             path_id,
             local_addr,
@@ -302,7 +305,8 @@ impl Path {
             active_dcid_seq,
             validation_state,
             state: PathState::Unused,
-            recovery: recovery::Recovery::new_with_config(recovery_config),
+            // recovery: recovery::Recovery::new_with_config(recovery_config),
+            recovery: r,
             pmtud: pmtud::Pmtud::new(pmtud_init),
             in_flight_challenges: VecDeque::new(),
             max_challenge_size: 0,
