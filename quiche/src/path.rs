@@ -294,6 +294,9 @@ impl Path {
             (PathValidationState::Unknown, None, None)
         };
 
+        let mut r = recovery::Recovery::new_with_config(recovery_config);
+        r.path_id = path_id as u64;
+
         Self {
             path_id,
             local_addr,
@@ -302,7 +305,8 @@ impl Path {
             active_dcid_seq,
             validation_state,
             state: PathState::Unused,
-            recovery: recovery::Recovery::new_with_config(recovery_config),
+            // recovery: recovery::Recovery::new_with_config(recovery_config),
+            recovery: r,
             pmtud: pmtud::Pmtud::new(pmtud_init),
             in_flight_challenges: VecDeque::new(),
             max_challenge_size: 0,
