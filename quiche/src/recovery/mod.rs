@@ -319,6 +319,8 @@ impl LossDetectionTimer {
     }
 }
 pub struct Recovery {
+    pub path_id: u64,
+
     epochs: [RecoveryEpoch; packet::Epoch::count()],
 
     loss_timer: LossDetectionTimer,
@@ -381,6 +383,8 @@ impl RecoveryConfig {
 impl Recovery {
     pub fn new_with_config(recovery_config: &RecoveryConfig) -> Self {
         Recovery {
+            path_id: 9999,
+
             epochs: Default::default(),
 
             loss_timer: Default::default(),
@@ -975,6 +979,7 @@ impl Recovery {
     #[cfg(feature = "qlog")]
     pub fn maybe_qlog(&mut self) -> Option<EventData> {
         let qlog_metrics = QlogMetrics {
+            path_id: self.path_id,
             min_rtt: *self.rtt_stats.min_rtt,
             smoothed_rtt: self.rtt(),
             latest_rtt: self.rtt_stats.latest_rtt,
@@ -1159,6 +1164,7 @@ impl Default for HandshakeStatus {
 #[derive(Default)]
 #[cfg(feature = "qlog")]
 struct QlogMetrics {
+    path_id: u64,
     min_rtt: Duration,
     smoothed_rtt: Duration,
     latest_rtt: Duration,
@@ -1244,10 +1250,13 @@ impl QlogMetrics {
             None
         };
 
+        let path_id = self.path_id;
+
         if emit_event {
             // QVis can't use all these fields and they can be large.
             return Some(EventData::MetricsUpdated(
                 qlog::events::quic::MetricsUpdated {
+                    path_id: Some(path_id),
                     min_rtt: new_min_rtt,
                     smoothed_rtt: new_smoothed_rtt,
                     latest_rtt: new_latest_rtt,
