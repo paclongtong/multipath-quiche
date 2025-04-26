@@ -571,7 +571,9 @@ pub fn connect(
         debug!("scheduled_tuples:{:?}", scheduled_tuples);
         // Generate outgoing QUIC packets and send them on the UDP socket, until
         // quiche reports that there are no more packets to be sent.
-
+        for (_,current_path) in conn.paths.iter(){
+            debug!("path stats: {:?} ", current_path.stats())
+        }
         if scheduled_tuples.len() == 1{
             for (local_addr, peer_addr, _) in scheduled_tuples {
                 let token = src_addr_to_token[&local_addr];

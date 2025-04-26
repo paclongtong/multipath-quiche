@@ -1522,7 +1522,7 @@ pub struct Connection {
     recovery_config: recovery::RecoveryConfig,
 
     /// The path manager.
-    paths: path::PathMap,
+    pub paths: path::PathMap,
 
     /// PATH_CHALLENGE receive queue max length.
     path_challenge_recv_max_queue_len: usize,
