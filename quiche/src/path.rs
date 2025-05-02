@@ -181,7 +181,7 @@ pub enum PathEvent {
 /// A network path on which QUIC packets can be sent.
 pub struct Path {
     /// The explicit path ID in multipath.
-    path_id: PathId,
+    pub path_id: PathId,
 
     /// The local address.
     local_addr: SocketAddr,
@@ -250,7 +250,7 @@ pub struct Path {
     peer_abandoned: bool,
 
     /// The scheduling status of this path.
-    status: PathStatus,
+    pub status: PathStatus,
 
     /// Total number of bytes the server can send before the peer's address
     /// is verified.

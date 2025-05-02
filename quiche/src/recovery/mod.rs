@@ -32,6 +32,7 @@ use std::time::Instant;
 use std::collections::VecDeque;
 
 use crate::packet::Epoch;
+use crate::path;
 use crate::ranges::RangeSet;
 use crate::Config;
 use crate::CongestionControlAlgorithm;
@@ -41,6 +42,7 @@ use crate::frame;
 use crate::packet;
 use crate::ranges;
 
+use libc::NDA_CACHEINFO;
 #[cfg(feature = "qlog")]
 use qlog::events::EventData;
 
@@ -349,7 +351,7 @@ pub struct Recovery {
     /// How many non-ack-eliciting packets have been sent.
     outstanding_non_ack_eliciting: usize,
 
-    congestion: Congestion,
+    pub congestion: Congestion,
 
     /// A resusable list of acks.
     newly_acked: Vec<Acked>,
@@ -1033,7 +1035,8 @@ impl std::fmt::Debug for Recovery {
                 write!(f, "timer=none ")?;
             },
         };
-
+        
+        write!(f, "path_id={:?} ", self.path_id)?;
         write!(f, "latest_rtt={:?} ", self.rtt_stats.latest_rtt)?;
         write!(f, "srtt={:?} ", self.rtt_stats.smoothed_rtt)?;
         write!(f, "min_rtt={:?} ", *self.rtt_stats.min_rtt)?;
@@ -1250,13 +1253,27 @@ impl QlogMetrics {
             None
         };
 
+<<<<<<< HEAD
         let path_id = self.path_id;
+=======
+        let path_id = if self.path_id != latest.path_id {
+            self.path_id = latest.path_id;
+            emit_event = true;
+            Some(latest.path_id)
+        } else {
+            Some(self.path_id)
+        };
+>>>>>>> 6447301a
 
         if emit_event {
             // QVis can't use all these fields and they can be large.
             return Some(EventData::MetricsUpdated(
                 qlog::events::quic::MetricsUpdated {
+<<<<<<< HEAD
                     path_id: Some(path_id),
+=======
+                    path_id: path_id,
+>>>>>>> 6447301a
                     min_rtt: new_min_rtt,
                     smoothed_rtt: new_smoothed_rtt,
                     latest_rtt: new_latest_rtt,
