@@ -743,6 +743,12 @@ fn main() {
                 
                                 panic!("send_to() failed: {:?}", e);
                             }
+
+                            trace!("-> {}: written {}", dst_info.unwrap().to, total_write);
+                            for (_,current_path) in client.conn.paths.iter(){
+                                // trace!("path stats: path{}: sent_count: {}, recv_count: {}, sent_bytes: {}, recv_bytes: {}", current_path.path_id, current_path.sent_count, current_path.recv_count, current_path.sent_bytes, current_path.recv_bytes);
+                                debug!("path stats: {:?} ", current_path.stats())
+                            }
                         }
                         bytes_left = bytes_left.saturating_sub(write);
                     }
