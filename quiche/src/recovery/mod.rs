@@ -167,9 +167,10 @@ impl RecoveryEpoch {
 
                     newly_acked.push(Acked {
                         pkt_num: unacked.pkt_num,
+                        // send_path_id: unacked.send_path_id,
                         time_sent: unacked.time_sent,
                         size: unacked.size,
-
+ 
                         rtt: now.saturating_duration_since(unacked.time_sent),
                         delivered: unacked.delivered,
                         delivered_time: unacked.delivered_time,
@@ -177,6 +178,7 @@ impl RecoveryEpoch {
                         is_app_limited: unacked.is_app_limited,
                     });
 
+                    // trace!("{} packet newly acked {} (sent on path {}", trace_id, unacked.pkt_num, unacked.send_path_id);
                     trace!("{} packet newly acked {}", trace_id, unacked.pkt_num);
 
                     self.acked_frames
@@ -1068,6 +1070,8 @@ impl std::fmt::Debug for Recovery {
 pub struct Sent {
     pub pkt_num: u64,
 
+    // pub send_path_id: u64,
+
     pub frames: SmallVec<[frame::Frame; 1]>,
 
     pub time_sent: Instant,
@@ -1102,6 +1106,7 @@ pub struct Sent {
 impl std::fmt::Debug for Sent {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "pkt_num={:?} ", self.pkt_num)?;
+        // write!(f, "send_path_id={:?} ", self.send_path_id)?;
         write!(f, "pkt_sent_time={:?} ", self.time_sent)?;
         write!(f, "pkt_size={:?} ", self.size)?;
         write!(f, "delivered={:?} ", self.delivered)?;
@@ -1122,6 +1127,8 @@ impl std::fmt::Debug for Sent {
 #[derive(Clone)]
 pub struct Acked {
     pub pkt_num: u64,
+
+    // pub send_path_id: u64,
 
     pub time_sent: Instant,
 
@@ -1253,9 +1260,6 @@ impl QlogMetrics {
             None
         };
 
-<<<<<<< HEAD
-        let path_id = self.path_id;
-=======
         let path_id = if self.path_id != latest.path_id {
             self.path_id = latest.path_id;
             emit_event = true;
@@ -1263,17 +1267,12 @@ impl QlogMetrics {
         } else {
             Some(self.path_id)
         };
->>>>>>> 6447301a
 
         if emit_event {
             // QVis can't use all these fields and they can be large.
             return Some(EventData::MetricsUpdated(
                 qlog::events::quic::MetricsUpdated {
-<<<<<<< HEAD
-                    path_id: Some(path_id),
-=======
                     path_id: path_id,
->>>>>>> 6447301a
                     min_rtt: new_min_rtt,
                     smoothed_rtt: new_smoothed_rtt,
                     latest_rtt: new_latest_rtt,

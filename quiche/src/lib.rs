@@ -9257,7 +9257,7 @@ impl Connection {
     /// Calling this method multiple times before [`send()`] has no effect.
     ///
     /// [`send()`]: struct.Connection.html#method.send
-    pub fn send_ack_eliciting(&mut self) -> Result<()> {
+    pub fn send_ack_eliciting(&mut self) -> Result<()> {    //
         if self.is_closed() || self.is_draining() {
             return Ok(());
         }
@@ -9272,7 +9272,7 @@ impl Connection {
     ///
     /// [`send_ack_eliciting()`]: struct.Connection.html#method.send_ack_eliciting
     /// [`InvalidState`]: enum.Error.html#variant.InvalidState
-    pub fn send_ack_eliciting_on_path(
+    pub fn send_ack_eliciting_on_path(  ////
         &mut self, local: SocketAddr, peer: SocketAddr,
     ) -> Result<()> {
         if self.is_closed() || self.is_draining() {

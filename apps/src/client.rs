@@ -623,6 +623,7 @@ pub fn connect(
             }
         }
         else{
+            // conn.send_ack_eliciting_on_path()
             for (local_addr, peer_addr, is_low_latency) in scheduled_tuples {
                 let token = src_addr_to_token[&local_addr];
                 let socket = &sockets[token];
