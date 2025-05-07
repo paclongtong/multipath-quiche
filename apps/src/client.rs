@@ -625,6 +625,28 @@ pub fn connect(
         else{
             // conn.send_ack_eliciting_on_path()
             for (local_addr, peer_addr, is_low_latency) in scheduled_tuples {
+                // let send_pid = 0;
+                // let send_path = conn.paths.get_mut(send_pid).map_err(|e| ClientError::Other(format!(
+                //     "quiche.paths.get_mut({}) failed: {:?}",
+                //     send_pid, e
+                // )))?;
+
+                // if !is_low_latency && send_path.active(){
+                //     match conn.send_ack_eliciting_on_path(local_addr, peer_addr) {
+                //         Ok(_) => {
+                //             debug!("Scheduled ack-eliciting packet on path {:?} -> {:?}", local_addr, peer_addr);
+                //         },
+                //         Err(e) => {
+                //             error!(
+                //             "Failed to schedule ack-eliciting packet on path {:?} -> {:?}: {:?}",
+                //             local_addr, peer_addr, e
+                //         );
+                //         // // Optionally continue or break
+                //         // continue;
+                //         },
+                //     }
+                // }
+
                 let token = src_addr_to_token[&local_addr];
                 let socket = &sockets[token];
                 let is_ack = is_low_latency;
