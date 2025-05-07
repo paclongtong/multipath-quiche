@@ -5933,104 +5933,116 @@ impl Connection {
             !is_closing &&
             path.active()
         {
-            // We first check if we should bundle the MP_ACK belonging to our
-            // path. We only bundle additional MP_ACK from other paths if we
-            // need to send one. This avoids sending MP_ACK frames endlessly.
-            let mut wrote_ack_mp = false;
-            let pns = self.pkt_num_spaces.spaces.get_mut(epoch, path_id)?;
-            if pns.recv_pkt_need_ack.len() > 0 && 
-                (pns.ack_elicited || ack_elicit_required) && *ack_mode
-            {
-                let ack_delay = pns.largest_rx_pkt_time.elapsed();
-
-                let ack_delay = ack_delay.as_micros() as u64 /
-                    2_u64.pow(
-                        self.local_transport_params.ack_delay_exponent as u32,
-                    );
-
-                let frame = frame::Frame::MPACK {
-                    path_identifier: path_id,
-                    ack_delay,
-                    ranges: pns.recv_pkt_need_ack.clone(),
-                    ecn_counts: None, /* sending ECN is not supported at
-                                       * this time */
-                };
-
-                // When a PING frame needs to be sent, avoid sending the
-                // MP_ACK if there is not enough cwnd
-                // available for both (note that PING
-                // frames are always 1 byte, so we just need to check that the'
-                // MP_ACK's length is lower than cwnd).
-                if (pns.ack_elicited ||
-                    (left_before_packing_ack_frame - left) + frame.wire_len() <
-                        cwnd_available) &&
-                    push_frame_to_pkt!(b, frames, frame, left)
-                {
-                    pns.ack_elicited = false;
-                    wrote_ack_mp = true;
-                }
-            }
-            if wrote_ack_mp {
-                for space_id in self
-                    .pkt_num_spaces
-                    .spaces
-                    .application_data_space_ids()
-                    .collect::<Vec<u64>>()
-                {
-                    // Don't process twice the path's packet number space.
-                    if space_id == path_id {
-                        continue;
-                    }
-                    // If the SCID is no more present, do not raise an error.
-                    let pns_path_id = paths.pid_from_path_id(space_id);
-                    let pns =
-                        self.pkt_num_spaces.spaces.get_mut(epoch, space_id)?;
-                    if pns.recv_pkt_need_ack.len() > 0 &&
+            if *ack_mode{
+                for current_space_id in self.pkt_num_spaces.spaces.application_data_space_ids().collect::<Vec<u64>>() {
+                    // We first check if we should bundle the MP_ACK belonging to our
+                    // path. We only bundle additional MP_ACK from other paths if we
+                    // need to send one. This avoids sending MP_ACK frames endlessly.
+                    // let mut wrote_ack_mp = false;
+                    let pns = self.pkt_num_spaces.spaces.get_mut(epoch, current_space_id)?;
+                    if pns.recv_pkt_need_ack.len() > 0 && 
                         (pns.ack_elicited || ack_elicit_required)
                     {
                         let ack_delay = pns.largest_rx_pkt_time.elapsed();
 
                         let ack_delay = ack_delay.as_micros() as u64 /
                             2_u64.pow(
-                                self.local_transport_params.ack_delay_exponent
-                                    as u32,
+                                self.local_transport_params.ack_delay_exponent as u32,
                             );
 
                         let frame = frame::Frame::MPACK {
-                            path_identifier: space_id,
+                            path_identifier: current_space_id,
                             ack_delay,
                             ranges: pns.recv_pkt_need_ack.clone(),
-                            ecn_counts: None, /* sending ECN is not
-                                               * supported at
-                                               * this time */
+                            ecn_counts: None, /* sending ECN is not supported at
+                                            * this time */
                         };
 
-                        if (!ack_elicit_required ||
-                            (left_before_packing_ack_frame - left) +
-                                frame.wire_len() <
-                                cwnd_available) &&
-                            push_frame_to_pkt!(b, frames, frame, left)
-                        {
-                            // Continue advertising until we send the
-                            // MP_ACK
-                            // on
-                            // its own path, unless the path is not
-                            // active.
-                            if let Some(path_id) = pns_path_id {
-                                if !paths.get(path_id)?.active() {
-                                    pns.ack_elicited = false;
-                                }
-                            } else {
+                        // When a PING frame needs to be sent, avoid sending the
+                        // MP_ACK if there is not enough cwnd
+                        // available for both (note that PING
+                        // frames are always 1 byte, so we just need to check that the'
+                        // MP_ACK's length is lower than cwnd).
+                        // if (pns.ack_elicited ||
+                        //     (left_before_packing_ack_frame - left) + frame.wire_len() <
+                        //         cwnd_available) &&
+                        //     push_frame_to_pkt!(b, frames, frame, left)
+                        let approx_current_payload_len = b.off() - payload_offset;
+                        if left >= frame.wire_len() && (approx_current_payload_len + frame.wire_len() <= cwnd_available) {
+                            if push_frame_to_pkt!(b, frames, frame, left) {
                                 pns.ack_elicited = false;
                             }
+                        } else {
+                            continue;
                         }
                     }
-                    // else {
-                    //     ack_mode = &mut false;
-                    //     debug!("No more packet to ack in some other path, reset ack_mode.")
-                    // }
                 }
             }
+            else {
+                debug!("Path {} is not selected for MPACK sending", path_id);
+            }
+
+            // if wrote_ack_mp {
+            //     for space_id in self
+            //         .pkt_num_spaces
+            //         .spaces
+            //         .application_data_space_ids()
+            //         .collect::<Vec<u64>>()
+            //     {
+            //         // Don't process twice the path's packet number space.
+            //         if space_id == path_id {
+            //             continue;
+            //         }
+            //         // If the SCID is no more present, do not raise an error.
+            //         let pns_path_id = paths.pid_from_path_id(space_id);
+            //         let pns =
+            //             self.pkt_num_spaces.spaces.get_mut(epoch, space_id)?;
+            //         if pns.recv_pkt_need_ack.len() > 0 &&
+            //             (pns.ack_elicited || ack_elicit_required)
+            //         {
+            //             let ack_delay = pns.largest_rx_pkt_time.elapsed();
+
+            //             let ack_delay = ack_delay.as_micros() as u64 /
+            //                 2_u64.pow(
+            //                     self.local_transport_params.ack_delay_exponent
+            //                         as u32,
+            //                 );
+
+            //             let frame = frame::Frame::MPACK {
+            //                 path_identifier: space_id,
+            //                 ack_delay,
+            //                 ranges: pns.recv_pkt_need_ack.clone(),
+            //                 ecn_counts: None, /* sending ECN is not
+            //                                    * supported at
+            //                                    * this time */
+            //             };
+
+            //             if (!ack_elicit_required ||
+            //                 (left_before_packing_ack_frame - left) +
+            //                     frame.wire_len() <
+            //                     cwnd_available) &&
+            //                 push_frame_to_pkt!(b, frames, frame, left)
+            //             {
+            //                 // Continue advertising until we send the
+            //                 // MP_ACK
+            //                 // on
+            //                 // its own path, unless the path is not
+            //                 // active.
+            //                 if let Some(path_id) = pns_path_id {
+            //                     if !paths.get(path_id)?.active() {
+            //                         pns.ack_elicited = false;
+            //                     }
+            //                 } else {
+            //                     pns.ack_elicited = false;
+            //                 }
+            //             }
+            //         }
+            //         // else {
+            //         //     ack_mode = &mut false;
+            //         //     debug!("No more packet to ack in some other path, reset ack_mode.")
+            //         // }
+            //     }
+            // }
         }
 
         // Limit output packet size by congestion window size.
