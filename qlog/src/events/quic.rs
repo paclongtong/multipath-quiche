@@ -817,6 +817,7 @@ pub struct MetricsUpdated {
     pub packets_in_flight: Option<u64>,
 
     pub pacing_rate: Option<u64>,
+    pub lost_spurious: Option<usize>,
 }
 
 #[serde_with::skip_serializing_none]
