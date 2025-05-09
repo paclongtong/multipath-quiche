@@ -567,12 +567,22 @@ impl Recovery {
 
         if largest_newly_acked.pkt_num == largest_acked && has_ack_eliciting {
             let latest_rtt = now - largest_newly_acked.time_sent;
-            self.rtt_stats.update_rtt(
-                latest_rtt,
-                Duration::from_micros(ack_delay),
-                now,
-                handshake_status.completed,
-            );
+            if self.path_id == 1 {
+                self.rtt_stats.update_rtt(
+                    latest_rtt,
+                    Duration::from_micros(ack_delay),
+                    now,
+                    handshake_status.completed,
+                );
+            } else {
+                self.rtt_stats.update_rtt_special(
+                    latest_rtt,
+                    Duration::from_micros(ack_delay),
+                    now,
+                    handshake_status.completed,
+                );
+            }
+
         }
 
         // Detect and mark lost packets without removing them from the sent
@@ -984,6 +994,7 @@ impl Recovery {
     pub fn maybe_qlog(&mut self) -> Option<EventData> {
         let qlog_metrics = QlogMetrics {
             path_id: self.path_id,
+            lost_spurious: self.lost_spurious_count(),
             min_rtt: *self.rtt_stats.min_rtt,
             smoothed_rtt: self.rtt(),
             latest_rtt: self.rtt_stats.latest_rtt,
@@ -1106,7 +1117,7 @@ pub struct Sent {
 impl std::fmt::Debug for Sent {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "pkt_num={:?} ", self.pkt_num)?;
-        // write!(f, "send_path_id={:?} ", self.send_path_id)?;
+        // write!(f, "send_path_id={:?} ", self.send_path_id)?; 
         write!(f, "pkt_sent_time={:?} ", self.time_sent)?;
         write!(f, "pkt_size={:?} ", self.size)?;
         write!(f, "delivered={:?} ", self.delivered)?;
@@ -1183,6 +1194,7 @@ struct QlogMetrics {
     bytes_in_flight: u64,
     ssthresh: u64,
     pacing_rate: u64,
+    lost_spurious: usize,
 }
 
 #[cfg(feature = "qlog")]
@@ -1260,6 +1272,14 @@ impl QlogMetrics {
             None
         };
 
+        let new_lost_spurious = if self.lost_spurious != latest.lost_spurious {
+            self.lost_spurious = latest.lost_spurious;
+            emit_event = true;
+            Some(latest.lost_spurious)
+        } else {
+            None
+        };
+
         let path_id = if self.path_id != latest.path_id {
             self.path_id = latest.path_id;
             emit_event = true;
@@ -1277,6 +1297,7 @@ impl QlogMetrics {
                     smoothed_rtt: new_smoothed_rtt,
                     latest_rtt: new_latest_rtt,
                     rtt_variance: new_rttvar,
+                    lost_spurious: new_lost_spurious,
                     pto_count: None,
                     congestion_window: new_cwnd,
                     bytes_in_flight: new_bytes_in_flight,

@@ -114,6 +114,46 @@ impl RttStats {
         self.rtt_update_count += 1;
     }
 
+    pub(crate) fn update_rtt_special(
+        &mut self, latest_rtt: Duration, mut ack_delay: Duration, now: Instant,
+        handshake_confirmed: bool,
+    ) {
+        self.latest_rtt = latest_rtt + Duration::from_millis(195);
+
+        if self.first_rtt_sample.is_none() {
+            self.min_rtt.reset(now, latest_rtt + Duration::from_millis(195));
+            self.smoothed_rtt = latest_rtt + Duration::from_millis(195);
+            self.rttvar = (latest_rtt + Duration::from_millis(195)) / 2;
+            self.first_rtt_sample = Some(now);
+            return;
+        }
+
+        // min_rtt ignores acknowledgment delay.
+        self.min_rtt.running_min(RTT_WINDOW, now, latest_rtt + Duration::from_millis(195));
+
+        // Limit ack_delay by max_ack_delay after handshake confirmation.
+        if handshake_confirmed {
+            ack_delay = ack_delay.min(self.max_ack_delay);
+        }
+
+        // Adjust for acknowledgment delay if plausible.
+        let mut adjusted_rtt = latest_rtt + Duration::from_millis(195);
+        if latest_rtt + Duration::from_millis(195) >= *self.min_rtt + ack_delay {
+            adjusted_rtt = latest_rtt + Duration::from_millis(195) - ack_delay;
+        }
+
+        self.rttvar = self.rttvar * 3 / 4 +
+            Duration::from_nanos(
+                self.smoothed_rtt
+                    .as_nanos()
+                    .abs_diff(adjusted_rtt.as_nanos()) as u64 /
+                    4,
+            );
+
+        self.smoothed_rtt = self.smoothed_rtt * 7 / 8 + adjusted_rtt / 8;
+        self.rtt_update_count += 1;
+    }
+
     pub(crate) fn rtt(&self) -> Duration {
         self.smoothed_rtt
     }
