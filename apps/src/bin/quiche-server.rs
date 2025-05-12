@@ -603,7 +603,6 @@ fn main() {
                     client.max_datagram_size *
                     client.max_datagram_size;
             debug!("send_quantum.min: {:?}", client.conn.send_quantum().min(client.max_send_burst));
-            let mut max_send_burst_mut = max_send_burst.clone();
             let mut total_write = 0;
             let mut dst_info: Option<quiche::SendInfo> = None;
             // Get all active paths sorted by latency
@@ -616,7 +615,6 @@ fn main() {
                 while total_write < max_send_burst {
                     // Case 1: Only one path available, fallback to normal send_on_path()
                     debug!("in the if loop");
-                    // let (local_addr, peer_addr, _) = scheduled_paths[0];
                     let res = match dst_info {
                         Some(info) => client.conn.send_on_path(
                             &mut out[total_write..max_send_burst],
@@ -685,74 +683,103 @@ fn main() {
             } 
             else {
                 let mut bytes_left = client.conn.send_quantum().min(client.max_send_burst);
-                trace!("bytes left: {}", bytes_left);
-                for (local_addr, peer_addr, is_low_latency) in &scheduled_paths {
-                    debug!("entered the else loop. Scheduled tuples:{:?}", scheduled_paths);
-                    'inner: loop{
-                        if bytes_left == 0 { 
-                            continue_write = true;
-                            break 'inner;
-                        }
-                        // Case 2: Multiple paths available, explicitly handle data-ack separation
-                    
-                        let is_ack = is_low_latency; // lowest latency path for ACK packets
+                trace!("Total bytes_left for this turn: {}", bytes_left);
+                let mut overall_continue_write = false;
 
-                        // Keep sending until done or blocked
+                for (local_addr, peer_addr, is_low_latency) in &scheduled_paths {
+                    let mut current_path_send_buffer = [0u8; MAX_BUF_SIZE];
+                    let mut current_path_written_total = 0;
+                    let mut current_path_dst_info: Option<quiche::SendInfo> = None;
+
+                    'path_send_loop: loop{
+                        if bytes_left == 0 || current_path_written_total >= current_path_send_buffer.len() {
+                            overall_continue_write = true; // Signal to try again soon if budget used up
+                            break 'path_send_loop;
+                        }
+
+                        let buffer_slice = &mut current_path_send_buffer[current_path_written_total..];
+                        let space_in_path_buffer = buffer_slice.len();
+                        // Limit what quiche can write by remaining bytes_left AND space in current_path_send_buffer
+                        let max_write_this_call = bytes_left.min(space_in_path_buffer);
+                
+                        // If max_write_this_call is too small (less than MSS), quiche might return Done.
+                        // Ensure it's reasonably sized or break.
+                        if max_write_this_call < MAX_DATAGRAM_SIZE / 2 && current_path_written_total > 0 { // Heuristic: if we have some data, don't try for tiny more
+                             overall_continue_write = true;
+                             break 'path_send_loop;
+                        }
+                         if max_write_this_call == 0 { // Defensive check
+                            overall_continue_write = true;
+                            break 'path_send_loop;
+                        }
+                    
+                        let is_ack = is_low_latency;
 
                         let res = client.conn.send_on_path_separate(
-                            &mut out,
+                            &mut buffer_slice[..max_write_this_call],
                             Some(*local_addr),
                             Some(*peer_addr),
                             &mut Some(*is_ack),
                         );
 
-                        let (write, send_info) = match res {
-                            Ok(v) => v,
-                            Err(quiche::Error::Done) => {
-                                continue_write = dst_info.is_some();
-                                debug!("Err(quiche::Error::Done)");
-                                break 'inner;
-                            }, // Nothing more for this path
-                            Err(e) => {
-                                error!("Send failed (multi-path): {:?}", e);
-                                client.conn.close(false, 0x1, b"fail").ok();
-                                break 'inner;
-                            }
-                        };
-
-                        // total_write += write;
-                        // dst_info.get_or_insert(send_info);
-                        dst_info = Some(send_info);
-                        let stats: Vec<_> = client.conn.path_stats().collect();
-                        trace!("dst_info:{:?}, path_stats:{:?}", dst_info, stats);
-                        
-                        if let Some(_) = dst_info {
-                            debug!("tx {} bytes to {:?}", write, dst_info.unwrap().to);
-                            if let Err(e) = send_to(
-                                &socket,
-                                &out[..write],
-                                &dst_info.unwrap(),
-                                client.max_datagram_size,
-                                pacing,
-                                enable_gso,
-                            ){
-                                if e.kind() == std::io::ErrorKind::WouldBlock {
-                                    trace!("send() would block");
-                                    break 'inner;
+                        match res {
+                            Ok((write, send_info)) => {
+                                if write > 0 {
+                                    current_path_written_total += write;
+                                    bytes_left = bytes_left.saturating_sub(write);
+                                    if current_path_dst_info.is_none() {
+                                        current_path_dst_info = Some(send_info);
+                                    }
+                                    // If quiche writes less than asked, it might be done for now for this path/flag
+                                    if write < max_write_this_call {
+                                        overall_continue_write = true;
+                                        break 'path_send_loop;
+                                    }
+                                } else { // write == 0, quiche is done for this path/flag for now
+                                    overall_continue_write = true; // Maybe other paths have data
+                                    break 'path_send_loop;
                                 }
-                
-                                panic!("send_to() failed: {:?}", e);
                             }
-
-                            trace!("-> {}: written {}", dst_info.unwrap().to, total_write);
-                            for (_,current_path) in client.conn.paths.iter(){
-                                // trace!("path stats: path{}: sent_count: {}, recv_count: {}, sent_bytes: {}, recv_bytes: {}", current_path.path_id, current_path.sent_count, current_path.recv_count, current_path.sent_bytes, current_path.recv_bytes);
-                                debug!("path stats: {:?} ", current_path.stats())
+                            Err(quiche::Error::Done) => {
+                                overall_continue_write = current_path_dst_info.is_some(); // If we sent something on this path before Done
+                                debug!("Path ({:?}, {:?}) done for now.", local_addr, peer_addr);
+                                break 'path_send_loop;
+                            }
+                            Err(e) => {
+                                error!("Send failed on path ({:?}, {:?}): {:?}", local_addr, peer_addr, e);
+                                client.conn.close(false, 0x1, b"fail").ok();
+                                current_path_written_total = 0; // Discard anything for this path
+                                break 'path_send_loop; 
                             }
                         }
-                        bytes_left = bytes_left.saturating_sub(write);
                     }
 
+                    if current_path_written_total > 0 && current_path_dst_info.is_some() {
+                        debug!("tx {} bytes to {:?}", current_path_written_total, current_path_dst_info.unwrap().to);
+                        if let Err(e) = send_to(
+                            &socket,
+                            &current_path_send_buffer[..current_path_written_total],
+                            &current_path_dst_info.unwrap(),
+                            client.max_datagram_size,
+                            pacing,
+                            enable_gso,
+                        ){
+                            if e.kind() == std::io::ErrorKind::WouldBlock {
+                                trace!("send() would block for path ({:?}, {:?})", local_addr, peer_addr);
+                                break;
+                            } else {
+                                panic!("send_to() failed: {:?}", e);
+                            }
+                        }
+
+                        for (pid, path_obj) in client.conn.paths.iter_mut() { // Assuming paths is a HashMap or similar
+                            debug!("Path {}: {:?}", pid, path_obj.stats());
+                        }
+                    }
+                }
+
+                if overall_continue_write {
+                    continue_write = true;
                 }
 
             }

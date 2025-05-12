@@ -689,7 +689,7 @@ pub struct PacketReceived {
     pub datagram_id: Option<u32>,
 
     pub trigger: Option<PacketReceivedTrigger>,
-
+    pub path_id: Option<usize>,
     pub frames: Option<Vec<QuicFrame>>,
 }
 
@@ -712,6 +712,8 @@ pub struct PacketSent {
     pub datagram_id: Option<u32>,
 
     pub trigger: Option<PacketSentTrigger>,
+
+    pub path_id: Option<usize>,
 
     pub send_at_time: Option<f32>,
 

@@ -3146,6 +3146,7 @@ impl Connection {
             let ev_data =
                 EventData::PacketReceived(qlog::events::quic::PacketReceived {
                     header: qlog_pkt_hdr,
+                    path_id: Some(recv_pid),
                     frames: Some(qlog_frames),
                     is_coalesced: None,
                     retry_token: None,
@@ -5105,6 +5106,7 @@ impl Connection {
                         supported_versions: None,
                         raw: Some(qlog_raw_info),
                         datagram_id: None,
+                        path_id: Some(send_pid),
                         send_at_time: Some(send_at_time),
                         trigger: None,
                     });
@@ -6895,6 +6897,7 @@ impl Connection {
                         supported_versions: None,
                         raw: Some(qlog_raw_info),
                         datagram_id: None,
+                        path_id: Some(send_pid),
                         send_at_time: Some(send_at_time),
                         trigger: None,
                     });
@@ -8343,6 +8346,7 @@ impl Connection {
                         supported_versions: None,
                         raw: Some(qlog_raw_info),
                         datagram_id: None,
+                        path_id: Some(send_pid),
                         send_at_time: Some(send_at_time),
                         trigger: None,
                     });

@@ -567,21 +567,27 @@ impl Recovery {
 
         if largest_newly_acked.pkt_num == largest_acked && has_ack_eliciting {
             let latest_rtt = now - largest_newly_acked.time_sent;
-            if self.path_id == 1 {
-                self.rtt_stats.update_rtt(
-                    latest_rtt,
-                    Duration::from_micros(ack_delay),
-                    now,
-                    handshake_status.completed,
-                );
-            } else {
-                self.rtt_stats.update_rtt_special(
-                    latest_rtt,
-                    Duration::from_micros(ack_delay),
-                    now,
-                    handshake_status.completed,
-                );
-            }
+            // if self.path_id == 1 {
+            //     self.rtt_stats.update_rtt(
+            //         latest_rtt,
+            //         Duration::from_micros(ack_delay),
+            //         now,
+            //         handshake_status.completed,
+            //     );
+            // } else {
+            //     self.rtt_stats.update_rtt_special(
+            //         latest_rtt,
+            //         Duration::from_micros(ack_delay),
+            //         now,
+            //         handshake_status.completed,
+            //     );
+            // }
+            self.rtt_stats.update_rtt(
+                latest_rtt,
+                Duration::from_micros(ack_delay),
+                now,
+                handshake_status.completed,
+            );
 
         }
 
