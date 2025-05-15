@@ -5727,6 +5727,7 @@ impl Connection {
         let flow_control = &mut self.flow_control;
         let crypto_space = self.pkt_num_spaces.crypto.get_mut(epoch);
         let multipath_enabled = self.paths.multipath();
+    {
         let paths = &mut self.paths;
 
         // Avoid being deadlocked if all available paths are standby.
@@ -5734,18 +5735,27 @@ impl Connection {
             // Force the availability of this path.
             paths.set_path_status(send_pid, PathStatus::Available)?;
         }
+    }
+    let (mut left, dcid_seq, path_id, path_is_active, ack_elicit_required) = {
+        let path = self.paths.get_mut(send_pid)?;
 
-        let path = paths.get_mut(send_pid)?;
-
-        let mut left = if path.pmtud.is_enabled() {
+        let left = if path.pmtud.is_enabled() {
+            let pmtu = path.pmtud.get_current();
             // Limit output buffer size by estimated path MTU.
-            cmp::min(path.pmtud.get_current(), b.cap())
+            cmp::min(pmtu, b.cap())
         } else {
             b.cap()
         };
-
+        let ack_elicit_required = path.recovery.should_elicit_ack(epoch);
         let dcid_seq = path.active_dcid_seq.ok_or(Error::OutOfIdentifiers)?;
         let path_id = path.path_id();
+        let path_is_active =
+            pkt_type == packet::Type::Short &&
+            !is_closing &&
+            path.active();
+
+        (left, dcid_seq, path_id, path_is_active, ack_elicit_required)
+    };
 
         let space_id = if multiple_application_data_pkt_num_spaces {
             path_id
@@ -5759,7 +5769,7 @@ impl Connection {
 
         let pn = pkt_space.next_pkt_num;
         let largest_acked_pkt =
-            path.recovery.get_largest_acked_on_epoch(epoch).unwrap_or(0);
+            self.paths.get(send_pid).unwrap().recovery.get_largest_acked_on_epoch(epoch).unwrap_or(0);
         let pn_len = packet::pkt_num_len(pn, largest_acked_pkt);
 
         // The AEAD overhead at the current encryption level.
@@ -5770,7 +5780,7 @@ impl Connection {
             self.ids.get_dcid(space_id, dcid_seq)?.cid.as_ref(),
         );
 
-        let scid = if let Some(scid_seq) = path.active_scid_seq {
+        let scid = if let Some(scid_seq) = self.paths.get(send_pid).unwrap().active_scid_seq {
             ConnectionId::from_ref(
                 self.ids.get_scid(space_id, scid_seq)?.cid.as_ref(),
             )
@@ -5838,7 +5848,6 @@ impl Connection {
         // Make sure we have enough space left for the packet overhead.
         match left.checked_sub(overhead) {
             Some(v) => left = v,
-
             None => {
                 // We can't send more because there isn't enough space available
                 // in the output buffer.
@@ -5846,13 +5855,17 @@ impl Connection {
                 // This usually happens when we try to send a new packet but
                 // failed because cwnd is almost full. In such case app_limited
                 // is set to false here to make cwnd grow when ACK is received.
-                path.recovery.update_app_limited(false);
+                {
+                    let path = self.paths.get_mut(send_pid)?;
+                    path.recovery.update_app_limited(false);
+                }
                 return Err(Error::Done);
-            },
+            }
         }
 
         // Make sure there is enough space for the minimum payload length.
         if left < PAYLOAD_MIN_LEN {
+            let mut path = &mut self.paths.get_mut(send_pid).unwrap();
             path.recovery.update_app_limited(false);
             return Err(Error::Done);
         }
@@ -5867,7 +5880,7 @@ impl Connection {
 
         // Whether or not we should explicitly elicit an ACK via PING frame if we
         // implicitly elicit one otherwise.
-        let ack_elicit_required = path.recovery.should_elicit_ack(epoch);
+        // let ack_elicit_required = path.recovery.should_elicit_ack(epoch);
 
         let header_offset = b.off();
 
@@ -5883,8 +5896,11 @@ impl Connection {
 
         let payload_offset = b.off();
 
-        let cwnd_available =
-            path.recovery.cwnd_available().saturating_sub(overhead);
+        let cwnd_available = {
+            let path = self.paths.get(send_pid)?;
+            path.recovery.cwnd_available().saturating_sub(overhead)
+        };
+            // path.recovery.cwnd_available().saturating_sub(overhead);
 
         let left_before_packing_ack_frame = left;
 
@@ -5902,7 +5918,7 @@ impl Connection {
                     self.local_error
                         .as_ref()
                         .map_or(false, |le| le.is_app))) &&
-            path.active()
+            self.paths.get(send_pid).unwrap().active()
         {
             let ack_delay = pkt_space.largest_rx_pkt_time.elapsed();
 
@@ -5933,7 +5949,7 @@ impl Connection {
         // Create MP_ACK frames if needed.
         if multiple_application_data_pkt_num_spaces &&
             !is_closing &&
-            path.active()
+            self.paths.get(send_pid).unwrap().active()
         {
             if *ack_mode{
                 for current_space_id in self.pkt_num_spaces.spaces.application_data_space_ids().collect::<Vec<u64>>() {
@@ -6164,8 +6180,8 @@ impl Connection {
                 key_update.update_acked = true;
             }
         }
-
-        let path = self.paths.get_mut(send_pid)?;
+    
+        // let path = self.paths.get_mut(send_pid)?;
 
         if pkt_type == packet::Type::Short && !is_closing {
             // Create NEW_CONNECTION_ID frames as needed.
@@ -6186,8 +6202,8 @@ impl Connection {
                 }
             }
         }
-
-        if pkt_type == packet::Type::Short && !is_closing && path.active() {
+    
+        if pkt_type == packet::Type::Short && !is_closing && path_is_active{
             // Create HANDSHAKE_DONE frame.
             // self.should_send_handshake_done() but without the need to borrow
             if self.handshake_completed &&
@@ -6243,7 +6259,8 @@ impl Connection {
                     in_flight = true;
                 }
             }
-
+            let data_path_id = 1 - send_pid;
+            let data_path = self.paths.get_mut(data_path_id).unwrap();
             // Create MAX_STREAM_DATA frames as needed.
             for stream_id in self.streams.almost_full() {
                 let stream = match self.streams.get_mut(stream_id) {
@@ -6258,7 +6275,7 @@ impl Connection {
                 };
 
                 // Autotune the stream window size.
-                stream.recv.autotune_window(now, path.recovery.rtt());
+                stream.recv.autotune_window(now, data_path.recovery.rtt());
 
                 let frame = frame::Frame::MaxStreamData {
                     stream_id,
@@ -6292,7 +6309,7 @@ impl Connection {
                 flow_control.max_data() < flow_control.max_data_next()
             {
                 // Autotune the connection window size.
-                flow_control.autotune_window(now, path.recovery.rtt());
+                flow_control.autotune_window(now, data_path.recovery.rtt());
 
                 let frame = frame::Frame::MaxData {
                     max: flow_control.max_data_next(),
@@ -6368,13 +6385,13 @@ impl Connection {
             }
 
             // Create RETIRE_CONNECTION_ID frames as needed.
-            while let Some((path_id, seq_num)) = self.ids.next_retire_dcid_seq() {
+            while let Some((ret_path_id, seq_num)) = self.ids.next_retire_dcid_seq() {
                 // The sequence number specified in a RETIRE_CONNECTION_ID frame
                 // MUST NOT refer to the Destination Connection ID field of the
                 // packet in which the frame is contained.
-                let dcid_seq = path.active_dcid_seq.ok_or(Error::InvalidState)?;
+                // let dcid_seq = path.active_dcid_seq.ok_or(Error::InvalidState)?; // defined previously
 
-                if path.path_id() == path_id && seq_num == dcid_seq {
+                if path_id == ret_path_id && seq_num == dcid_seq {
                     // XXX: we need to look for another available CID.
                     break;
                 }
