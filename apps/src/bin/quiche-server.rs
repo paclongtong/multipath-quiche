@@ -91,7 +91,7 @@ fn main() {
 
     info!("listening on {:}", socket.local_addr().unwrap());
 
-    // pacing = false; // temporary change for testing the pacing issue
+    pacing = false; // temporary change for testing the pacing issue
 
     poll.registry()
         .register(&mut socket, mio::Token(0), mio::Interest::READABLE)
@@ -551,36 +551,36 @@ fn main() {
         }
 
         use itertools::Itertools;
-        fn lowest_latency_scheduler_flagged(
-            conn: &quiche::Connection,
-        ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr, bool)> {
-            let sorted_paths: Vec<_> = conn
-                // .path_stats()
-                // .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
-                // .sorted_by_key(|p| p.rtt)
-                // .map(|p| (p.local_addr, p.peer_addr))
-                // .collect();
-                .path_stats()
-                .filter(|p| p.active)                // <-- validated & marked active
-                .sorted_by_key(|p| p.rtt)
-                .map(|p| (p.local_addr, p.peer_addr))
-                .collect();
-        
-            sorted_paths
-                .into_iter()
-                .enumerate()
-                .map(|(i, (laddr, paddr))| (laddr, paddr, i == 0))
-        }
-
         // fn lowest_latency_scheduler_flagged(
         //     conn: &quiche::Connection,
         // ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr, bool)> {
-        //     conn.path_stats()
-        //         .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
+        //     let sorted_paths: Vec<_> = conn
+        //         // .path_stats()
+        //         // .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
+        //         // .sorted_by_key(|p| p.rtt)
+        //         // .map(|p| (p.local_addr, p.peer_addr))
+        //         // .collect();
+        //         .path_stats()
+        //         .filter(|p| p.active)                // <-- validated & marked active
         //         .sorted_by_key(|p| p.rtt)
+        //         .map(|p| (p.local_addr, p.peer_addr))
+        //         .collect();
+        
+        //     sorted_paths
+        //         .into_iter()
         //         .enumerate()
-        //         .map(|(i, p)| (p.local_addr, p.peer_addr, i == 0))
+        //         .map(|(i, (laddr, paddr))| (laddr, paddr, i == 0))
         // }
+
+        fn lowest_latency_scheduler_flagged(
+            conn: &quiche::Connection,
+        ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr, bool)> {
+            conn.path_stats()
+                .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
+                .sorted_by_key(|p| p.rtt)
+                .enumerate()
+                .map(|(i, p)| (p.local_addr, p.peer_addr, i == 0))
+        }
 
 
         // Generate outgoing QUIC packets for all active connections and send
