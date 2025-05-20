@@ -121,9 +121,9 @@ impl RttStats {
         self.latest_rtt = latest_rtt + Duration::from_millis(195);
 
         if self.first_rtt_sample.is_none() {
-            self.min_rtt.reset(now, latest_rtt + Duration::from_millis(195));
-            self.smoothed_rtt = latest_rtt + Duration::from_millis(195);
-            self.rttvar = (latest_rtt + Duration::from_millis(195)) / 2;
+            self.min_rtt.reset(now, latest_rtt);
+            self.smoothed_rtt = latest_rtt;
+            self.rttvar = (latest_rtt) / 2;
             self.first_rtt_sample = Some(now);
             return;
         }

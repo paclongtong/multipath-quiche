@@ -614,6 +614,96 @@ impl Recovery {
         Ok((loss.0, loss.1, acked_bytes))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_ack_received_calibration(
+        &mut self, ranges: &ranges::RangeSet, ack_delay: u64,
+        epoch: packet::Epoch, handshake_status: HandshakeStatus, now: Instant,
+        trace_id: &str, is_server: bool
+    ) -> Result<(usize, usize, usize)> {
+        let largest_acked = ranges.last().unwrap();
+
+        // Update the largest acked packet.
+        let largest_acked = self.epochs[epoch]
+            .largest_acked_packet
+            .unwrap_or(0)
+            .max(largest_acked);
+
+        self.epochs[epoch].largest_acked_packet = Some(largest_acked);
+
+        let AckedDetectionResult {
+            acked_bytes,
+            spurious_losses,
+            spurious_pkt_thresh,
+            has_ack_eliciting,
+            has_in_flight_spurious_loss,
+        } = self.epochs[epoch].detect_and_remove_acked_packets(
+            now,
+            ranges,
+            &mut self.newly_acked,
+            &self.rtt_stats,
+            trace_id,
+        );
+
+        self.lost_spurious_count += spurious_losses;
+        if let Some(thresh) = spurious_pkt_thresh {
+            self.pkt_thresh =
+                self.pkt_thresh.max(thresh.min(MAX_PACKET_THRESHOLD));
+        }
+
+        // Undo congestion window update.
+        if has_in_flight_spurious_loss {
+            (self.congestion.cc_ops.rollback)(&mut self.congestion);
+        }
+
+        if self.newly_acked.is_empty() {
+            return Ok((0, 0, 0));
+        }
+
+        // Check if largest packet is newly acked.
+        let largest_newly_acked = self.newly_acked.last().unwrap();
+
+        if largest_newly_acked.pkt_num == largest_acked && has_ack_eliciting {
+            let latest_rtt = now - largest_newly_acked.time_sent;
+            if self.path_id == 0 && is_server {
+                self.rtt_stats.update_rtt_special(
+                    latest_rtt,
+                    Duration::from_micros(ack_delay),
+                    now,
+                    handshake_status.completed,
+                );
+            } else {
+                self.rtt_stats.update_rtt(
+                    latest_rtt,
+                    Duration::from_micros(ack_delay),
+                    now,
+                    handshake_status.completed,
+                );
+            }
+
+        }
+
+        // Detect and mark lost packets without removing them from the sent
+        // packets list.
+        let loss = self.detect_lost_packets(epoch, now, trace_id);
+
+        self.congestion.on_packets_acked(
+            self.bytes_in_flight,
+            &mut self.newly_acked,
+            &self.rtt_stats,
+            now,
+        );
+
+        self.bytes_in_flight -= acked_bytes;
+
+        self.pto_count = 0;
+
+        self.set_loss_detection_timer(handshake_status, now);
+
+        self.epochs[epoch]
+            .drain_acked_and_lost_packets(now - self.rtt_stats.rtt());
+
+        Ok((loss.0, loss.1, acked_bytes))
+    }
     pub fn on_loss_detection_timeout(
         &mut self, handshake_status: HandshakeStatus, now: Instant,
         trace_id: &str,
