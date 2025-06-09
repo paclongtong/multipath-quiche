@@ -955,6 +955,7 @@ mod tests {
         }];
         let event_data = EventData::PacketSent(PacketSent {
             header: pkt_hdr,
+            path_id: None,
             frames: Some(frames.into()),
             is_coalesced: None,
             retry_token: None,

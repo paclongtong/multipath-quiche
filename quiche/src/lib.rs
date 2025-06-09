@@ -5098,6 +5098,7 @@ impl Connection {
 
                 let ev_data =
                     EventData::PacketSent(qlog::events::quic::PacketSent {
+                        path_id: Some(send_pid),
                         header,
                         frames: Some(qlog_frames),
                         is_coalesced: None,
@@ -5106,7 +5107,6 @@ impl Connection {
                         supported_versions: None,
                         raw: Some(qlog_raw_info),
                         datagram_id: None,
-                        path_id: Some(send_pid),
                         send_at_time: Some(send_at_time),
                         trigger: None,
                     });
@@ -6906,6 +6906,7 @@ impl Connection {
 
                 let ev_data =
                     EventData::PacketSent(qlog::events::quic::PacketSent {
+                        path_id: Some(send_pid),
                         header,
                         frames: Some(qlog_frames),
                         is_coalesced: None,
@@ -6914,7 +6915,6 @@ impl Connection {
                         supported_versions: None,
                         raw: Some(qlog_raw_info),
                         datagram_id: None,
-                        path_id: Some(send_pid),
                         send_at_time: Some(send_at_time),
                         trigger: None,
                     });
@@ -8355,6 +8355,7 @@ impl Connection {
 
                 let ev_data =
                     EventData::PacketSent(qlog::events::quic::PacketSent {
+                        path_id: Some(send_pid),
                         header,
                         frames: Some(qlog_frames),
                         is_coalesced: None,
@@ -8363,7 +8364,6 @@ impl Connection {
                         supported_versions: None,
                         raw: Some(qlog_raw_info),
                         datagram_id: None,
-                        path_id: Some(send_pid),
                         send_at_time: Some(send_at_time),
                         trigger: None,
                     });

@@ -55,6 +55,106 @@ const MAX_BUF_SIZE: usize = 65507;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
+#[derive(Debug, Clone, PartialEq)]
+enum SendMode {
+    AckPriority,    // Low-latency path: prioritize ACKs
+    TryingData,     // Low-latency path: trying to send data after ACKs
+    DataOnly,       // High-latency path: data only
+}
+
+#[derive(Debug)]
+struct PathSendState {
+    mode: SendMode,
+    data_burst_size: usize,
+    last_ack_check: std::time::Instant,
+}
+
+impl PathSendState {
+    fn new() -> Self {
+        Self {
+            mode: SendMode::AckPriority,
+            data_burst_size: 0,
+            last_ack_check: std::time::Instant::now(),
+        }
+    }
+}
+
+fn determine_send_mode(
+    is_low_latency: bool,
+    path_state: &mut PathSendState,
+    conn: &quiche::Connection,
+    path_key: (std::net::SocketAddr, std::net::SocketAddr),
+) -> Option<bool> {
+    if !is_low_latency {
+        // High-latency path: data only
+        path_state.mode = SendMode::DataOnly;
+        return Some(false);
+    }
+
+    // Low-latency path: flexible ACK/data distribution
+    match path_state.mode {
+        SendMode::AckPriority => {
+            // Check if we have pending ACKs - this is a heuristic since we can't directly query
+            // We'll always try ACKs first on low-latency paths
+            Some(true)
+        }
+        SendMode::TryingData => {
+            // Limit data burst size to preserve ACK responsiveness
+            const MAX_DATA_BURST: usize = 8192; // ~6 packets
+            if path_state.data_burst_size < MAX_DATA_BURST {
+                Some(false)
+            } else {
+                // Reset to ACK mode after burst
+                path_state.mode = SendMode::AckPriority;
+                path_state.data_burst_size = 0;
+                Some(true)
+            }
+        }
+        SendMode::DataOnly => {
+            // This shouldn't happen for low-latency paths
+            Some(false)
+        }
+    }
+}
+
+fn should_try_data_mode(
+    path_state: &PathSendState,
+    current_ack_eliciting_only: Option<bool>,
+) -> bool {
+    match path_state.mode {
+        SendMode::AckPriority => {
+            // If we were trying to send ACKs but got nothing, try data
+            current_ack_eliciting_only == Some(true)
+        }
+        _ => false,
+    }
+}
+
+fn update_path_state(
+    path_state: &mut PathSendState,
+    ack_eliciting_only: Option<bool>,
+    bytes_written: usize,
+) {
+    match ack_eliciting_only {
+        Some(true) => {
+            // Sent ACKs, can now try data if there's bandwidth
+            if path_state.mode == SendMode::AckPriority {
+                path_state.mode = SendMode::TryingData;
+                path_state.data_burst_size = 0;
+            }
+        }
+        Some(false) => {
+            // Sent data
+            if matches!(path_state.mode, SendMode::TryingData) {
+                path_state.data_burst_size += bytes_written;
+            }
+        }
+        None => {
+            // Mixed or unknown
+        }
+    }
+}
+
 fn main() {
     let mut buf = [0; MAX_BUF_SIZE];
     let mut out = [0; MAX_BUF_SIZE];
@@ -576,7 +676,7 @@ fn main() {
             conn: &quiche::Connection,
         ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr, bool)> {
             conn.path_stats()
-                .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
+                .filter(|p| p.active)
                 .sorted_by_key(|p| p.rtt)
                 .enumerate()
                 .map(|(i, p)| (p.local_addr, p.peer_addr, i == 0))
@@ -685,10 +785,17 @@ fn main() {
             } 
             else {
                 let mut bytes_left = client.conn.send_quantum().min(client.max_send_burst);
+                // TODO: send_quantum() should also be path-awared, and reasonably be split and handled per-path
+                // bytes left should be per-path, and how to prevent the round-back continue-write from re-entering the path that was just iterated? path0-path1-continuewrite-path0(again)
                 trace!("Total bytes_left for this turn: {}", bytes_left);
                 let mut overall_continue_write = false;
 
+                    // Track per-path state to prevent ACK preemption issues
+                let mut path_states: HashMap<(std::net::SocketAddr, std::net::SocketAddr), PathSendState> = HashMap::new();
                 for (local_addr, peer_addr, is_low_latency) in &scheduled_paths {
+                    let path_key = (*local_addr, *peer_addr);
+                    let path_state = path_states.entry(path_key).or_insert(PathSendState::new());
+
                     let mut current_path_send_buffer = [0u8; MAX_BUF_SIZE];
                     let mut current_path_written_total = 0;
                     let mut current_path_dst_info: Option<quiche::SendInfo> = None;
@@ -707,6 +814,7 @@ fn main() {
                         // If max_write_this_call is too small (less than MSS), quiche might return Done.
                         // Ensure it's reasonably sized or break.
                         if max_write_this_call < MAX_DATAGRAM_SIZE / 2 && current_path_written_total > 0 { // Heuristic: if we have some data, don't try for tiny more
+                            // There is a problem when path1 is in iteration and there was just a packet pushed in, this would be triggered, leading to small packet on path1
                              overall_continue_write = true;
                              break 'path_send_loop;
                         }
@@ -715,13 +823,13 @@ fn main() {
                             break 'path_send_loop;
                         }
                     
-                        let is_ack = is_low_latency;
+                        let mut ack_eliciting_only = determine_send_mode(*is_low_latency, path_state, &client.conn, path_key);
 
                         let res = client.conn.send_on_path_separate(
                             &mut buffer_slice[..max_write_this_call],
                             Some(*local_addr),
-                            Some(*peer_addr),
-                            &mut Some(*is_ack),
+                            Some(*peer_addr),   
+                            &mut ack_eliciting_only,
                         );
 
                         match res {
@@ -729,6 +837,9 @@ fn main() {
                                 if write > 0 {
                                     current_path_written_total += write;
                                     bytes_left = bytes_left.saturating_sub(write);
+
+                                    // Update path state based on what was sent
+                                    update_path_state(path_state, ack_eliciting_only, write);
                                     if current_path_dst_info.is_none() {
                                         current_path_dst_info = Some(send_info);
                                     }
@@ -738,11 +849,21 @@ fn main() {
                                         break 'path_send_loop;
                                     }
                                 } else { // write == 0, quiche is done for this path/flag for now
+                                    // If we were sending ACKs, try sending data on the same path now
+                                    if *is_low_latency && should_try_data_mode(path_state, ack_eliciting_only) == Some(true) {
+                                        path_state.mode = SendMode::TryingData;
+                                        continue 'path_send_loop;
+                                    }
                                     overall_continue_write = true; // Maybe other paths have data
                                     break 'path_send_loop;
                                 }
                             }
                             Err(quiche::Error::Done) => {
+                                // If we were sending ACKs, try sending data on the same path now
+                                if *is_low_latency && should_try_data_mode(path_state, ack_eliciting_only) == Some(true) {
+                                    ack_eliciting_only = Some(false);
+                                    continue 'path_send_loop;
+                                }
                                 overall_continue_write = current_path_dst_info.is_some(); // If we sent something on this path before Done
                                 debug!("Path ({:?}, {:?}) done for now.", local_addr, peer_addr);
                                 break 'path_send_loop;
