@@ -117,19 +117,6 @@ fn determine_send_mode(
     }
 }
 
-fn should_try_data_mode(
-    path_state: &PathSendState,
-    current_ack_eliciting_only: Option<bool>,
-) -> bool {
-    match path_state.mode {
-        SendMode::AckPriority => {
-            // If we were trying to send ACKs but got nothing, try data
-            current_ack_eliciting_only == Some(true)
-        }
-        _ => false,
-    }
-}
-
 fn update_path_state(
     path_state: &mut PathSendState,
     ack_eliciting_only: Option<bool>,
@@ -849,9 +836,10 @@ fn main() {
                                         break 'path_send_loop;
                                     }
                                 } else { // write == 0, quiche is done for this path/flag for now
-                                    // If we were sending ACKs, try sending data on the same path now
-                                    if *is_low_latency && should_try_data_mode(path_state, ack_eliciting_only) == Some(true) {
+                                    // If we were trying to send ACKs, try sending data on the same path now
+                                    if *is_low_latency && path_state.mode == SendMode::AckPriority {
                                         path_state.mode = SendMode::TryingData;
+                                        path_state.data_burst_size = 0;
                                         continue 'path_send_loop;
                                     }
                                     overall_continue_write = true; // Maybe other paths have data
@@ -859,11 +847,13 @@ fn main() {
                                 }
                             }
                             Err(quiche::Error::Done) => {
-                                // If we were sending ACKs, try sending data on the same path now
-                                if *is_low_latency && should_try_data_mode(path_state, ack_eliciting_only) == Some(true) {
-                                    ack_eliciting_only = Some(false);
+                                // If we were sending ACKs on the low-latency path, try sending data now.
+                                if *is_low_latency && path_state.mode == SendMode::AckPriority {
+                                    path_state.mode = SendMode::TryingData;
+                                    path_state.data_burst_size = 0;
                                     continue 'path_send_loop;
                                 }
+
                                 overall_continue_write = current_path_dst_info.is_some(); // If we sent something on this path before Done
                                 debug!("Path ({:?}, {:?}) done for now.", local_addr, peer_addr);
                                 break 'path_send_loop;
