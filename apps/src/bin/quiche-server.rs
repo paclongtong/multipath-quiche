@@ -91,7 +91,7 @@ fn main() {
 
     info!("listening on {:}", socket.local_addr().unwrap());
 
-    pacing = false; // temporary change for testing the pacing issue
+    // pacing = false; // temporary change for testing the pacing issue
 
     poll.registry()
         .register(&mut socket, mio::Token(0), mio::Interest::READABLE)
@@ -577,7 +577,7 @@ fn main() {
         ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr, bool)> {
             conn.path_stats()
                 .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
-                .sorted_by_key(|p| p.rtt)
+                .sorted_by_key(|p| p.min_rtt.unwrap_or(std::time::Duration::MAX))
                 .enumerate()
                 .map(|(i, p)| (p.local_addr, p.peer_addr, i == 0))
         }

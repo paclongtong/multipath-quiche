@@ -673,6 +673,7 @@ pub struct DatagramDropped {
 #[serde_with::skip_serializing_none]
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct PacketReceived {
+    pub path_id: Option<usize>,
     pub header: PacketHeader,
     // `frames` is defined here in the QLog schema specification. However,
     // our streaming serializer requires serde to put the object at the end,
@@ -689,13 +690,13 @@ pub struct PacketReceived {
     pub datagram_id: Option<u32>,
 
     pub trigger: Option<PacketReceivedTrigger>,
-    pub path_id: Option<usize>,
     pub frames: Option<Vec<QuicFrame>>,
 }
 
 #[serde_with::skip_serializing_none]
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct PacketSent {
+    pub path_id: Option<usize>,
     pub header: PacketHeader,
     // `frames` is defined here in the QLog schema specification. However,
     // our streaming serializer requires serde to put the object at the end,
@@ -712,8 +713,6 @@ pub struct PacketSent {
     pub datagram_id: Option<u32>,
 
     pub trigger: Option<PacketSentTrigger>,
-
-    pub path_id: Option<usize>,
 
     pub send_at_time: Option<f32>,
 

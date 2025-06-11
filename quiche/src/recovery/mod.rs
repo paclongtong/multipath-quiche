@@ -1340,7 +1340,8 @@ impl QlogMetrics {
             emit_event = true;
             Some(latest.cwnd)
         } else {
-            None
+            // None
+            Some(self.cwnd)
         };
 
         let new_bytes_in_flight =
