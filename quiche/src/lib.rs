@@ -3028,6 +3028,7 @@ impl Connection {
 
             let ev_data =
                 EventData::PacketReceived(qlog::events::quic::PacketReceived {
+                    path_id: Some(recv_pid),
                     header: qlog_pkt_hdr,
                     frames: Some(qlog_frames),
                     is_coalesced: None,
@@ -4962,6 +4963,7 @@ impl Connection {
 
                 let ev_data =
                     EventData::PacketSent(qlog::events::quic::PacketSent {
+                        path_id: Some(send_pid),
                         header,
                         frames: Some(qlog_frames),
                         is_coalesced: None,
