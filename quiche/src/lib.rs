@@ -5098,6 +5098,7 @@ impl Connection {
 
                 let ev_data =
                     EventData::PacketSent(qlog::events::quic::PacketSent {
+                        path_id: Some(send_pid),
                         header,
                         frames: Some(qlog_frames),
                         is_coalesced: None,
@@ -5106,7 +5107,6 @@ impl Connection {
                         supported_versions: None,
                         raw: Some(qlog_raw_info),
                         datagram_id: None,
-                        path_id: Some(send_pid),
                         send_at_time: Some(send_at_time),
                         trigger: None,
                     });
@@ -6906,6 +6906,7 @@ impl Connection {
 
                 let ev_data =
                     EventData::PacketSent(qlog::events::quic::PacketSent {
+                        path_id: Some(send_pid),
                         header,
                         frames: Some(qlog_frames),
                         is_coalesced: None,
@@ -6914,7 +6915,6 @@ impl Connection {
                         supported_versions: None,
                         raw: Some(qlog_raw_info),
                         datagram_id: None,
-                        path_id: Some(send_pid),
                         send_at_time: Some(send_at_time),
                         trigger: None,
                     });
@@ -8355,6 +8355,7 @@ impl Connection {
 
                 let ev_data =
                     EventData::PacketSent(qlog::events::quic::PacketSent {
+                        path_id: Some(send_pid),
                         header,
                         frames: Some(qlog_frames),
                         is_coalesced: None,
@@ -8363,7 +8364,6 @@ impl Connection {
                         supported_versions: None,
                         raw: Some(qlog_raw_info),
                         datagram_id: None,
-                        path_id: Some(send_pid),
                         send_at_time: Some(send_at_time),
                         trigger: None,
                     });
@@ -11642,26 +11642,26 @@ impl Connection {
                     if is_app_limited {
                         p.recovery.delivery_rate_update_app_limited(true);
                     }
-                    // let (lost_packets, lost_bytes, acked_bytes) =
-                    //     p.recovery.on_ack_received(
-                    //         &ranges,
-                    //         ack_delay,
-                    //         epoch,
-                    //         handshake_status,
-                    //         now,
-                    //         &self.trace_id,
-                    //     )?;
-
                     let (lost_packets, lost_bytes, acked_bytes) =
-                        p.recovery.on_ack_received_calibration(
+                        p.recovery.on_ack_received(
                             &ranges,
                             ack_delay,
                             epoch,
                             handshake_status,
                             now,
                             &self.trace_id,
-                            is_server
                         )?;
+
+                    // let (lost_packets, lost_bytes, acked_bytes) =
+                    //     p.recovery.on_ack_received_calibration(
+                    //         &ranges,
+                    //         ack_delay,
+                    //         epoch,
+                    //         handshake_status,
+                    //         now,
+                    //         &self.trace_id,
+                    //         is_server
+                    //     )?;
                     self.lost_count += lost_packets;
                     self.lost_bytes += lost_bytes as u64;
                     self.acked_bytes += acked_bytes as u64;
