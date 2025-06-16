@@ -664,7 +664,7 @@ fn main() {
         ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr, bool)> {
             conn.path_stats()
                 .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
-                .sorted_by_key(|p| p.min_rtt.unwrap_or(std::time::Duration::MAX))
+                .sorted_by_key(|p| p.rtt)
                 .enumerate()
                 .map(|(i, p)| (p.local_addr, p.peer_addr, i == 0))
         }
