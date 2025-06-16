@@ -697,7 +697,6 @@ pub struct PacketReceived {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct PacketSent {
     pub path_id: Option<usize>,
-
     pub header: PacketHeader,
     // `frames` is defined here in the QLog schema specification. However,
     // our streaming serializer requires serde to put the object at the end,
