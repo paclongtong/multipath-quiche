@@ -29,6 +29,10 @@
 //! This implementation is based on the following draft:
 //! <https://tools.ietf.org/html/draft-cardwell-iccrg-bbr-congestion-control-00>
 
+// BBR LOGGING START: Added imports for logging
+use std::fs::OpenOptions;
+use std::io::Write;
+// BBR LOGGING END
 use crate::minmax::Minmax;
 use crate::recovery::*;
 
@@ -279,6 +283,10 @@ fn bbr_exit_recovery(r: &mut Congestion) {
 //
 fn on_init(r: &mut Congestion) {
     init::bbr_init(r);
+    match std::env::var("QUICHE_BBR_LOG") {
+        Ok(val) => debug!("[DEBUG] QUICHE_BBR_LOG is set to: {}", val),
+        Err(_) => debug!("[DEBUG] QUICHE_BBR_LOG is NOT set."),
+    }
 }
 
 fn on_packet_sent(
@@ -311,6 +319,37 @@ fn on_packets_acked(
 
     per_ack::bbr_update_control_parameters(r, bytes_in_flight, now);
 
+    // BBR LOGGING START
+    // Log BBR state on each ACK event.
+    // Note: A placeholder '0' is used for path_id. This should be replaced with
+    // a real path identifier from the connection context.
+    // log_bbr_state(r, r.path_id, now, _rtt_stats.latest_rtt, bytes_in_flight);
+    // BBR LOGGING END
+
+    // DEBUG LOGGING for ACK
+    let bbr = &r.bbr_state;
+    let delivery_rate = r.delivery_rate.sample_delivery_rate();
+    debug!(
+        "BBR_ACK_EVENT: path_id={}, now_ms={}, state={:?}, btlbw={}, pacing_rate={}, delivery_rate={}, rtprop_us={}, latest_rtt_us={}, cwnd={}, bytes_in_flight={}, pacing_gain={:.2}, cwnd_gain={:.2}, cycle_idx={}, newly_lost_bytes={}, app_limited={}, prior_bytes_in_flight={}, newly_acked_bytes={}",
+        r.path_id, // Assuming Congestion has a path_id field
+        (now - bbr.start_time).as_millis(), // Relative time
+        bbr.state,
+        bbr.btlbw,
+        bbr.pacing_rate,
+        delivery_rate,
+        bbr.rtprop.as_micros(),
+        _rtt_stats.latest_rtt.as_micros(),
+        r.congestion_window,
+        bytes_in_flight, // Current bytes_in_flight
+        bbr.pacing_gain,
+        bbr.cwnd_gain,
+        bbr.cycle_index,
+        bbr.newly_lost_bytes, // Will be 0 here as it's reset below
+        r.app_limited,
+        r.bbr_state.prior_bytes_in_flight, // Value before this ACK processing
+        r.bbr_state.newly_acked_bytes
+    );
+
     r.bbr_state.newly_lost_bytes = 0;
 }
 
@@ -325,6 +364,35 @@ fn congestion_event(
         // Upon entering Fast Recovery.
         bbr_enter_recovery(r, bytes_in_flight - lost_bytes, now);
     }
+
+    // BBR LOGGING START
+    // Log BBR state on each loss event.
+    // Note: RttStats is not available here, so latest_rtt is logged as zero.
+    // A placeholder '0' is used for path_id.
+    // log_bbr_state(r, r.path_id, now, Duration::ZERO, bytes_in_flight);
+    // BBR LOGGING END
+
+    // DEBUG LOGGING for LOSS
+    let bbr = &r.bbr_state;
+    let delivery_rate = r.delivery_rate.sample_delivery_rate();
+    debug!(
+        "BBR_LOSS_EVENT: path_id={}, now_ms={}, state={:?}, btlbw={}, pacing_rate={}, delivery_rate={}, rtprop_us={}, latest_rtt_us=N/A, cwnd={}, bytes_in_flight={}, pacing_gain={:.2}, cwnd_gain={:.2}, cycle_idx={}, newly_lost_bytes={}, app_limited={}",
+        r.path_id, // Assuming Congestion has a path_id field
+        (now - bbr.start_time).as_millis(), // Relative time
+        bbr.state,
+        bbr.btlbw,
+        bbr.pacing_rate,
+        delivery_rate,
+        bbr.rtprop.as_micros(),
+        // latest_rtt is not directly available here, you could pass RttStats if needed
+        r.congestion_window,
+        bytes_in_flight, // bytes_in_flight before accounting for this loss event for cwnd adjustment
+        bbr.pacing_gain,
+        bbr.cwnd_gain,
+        bbr.cycle_index,
+        bbr.newly_lost_bytes, // This is set correctly for the current event
+        r.app_limited
+    );
 }
 
 fn checkpoint(_r: &mut Congestion) {}
@@ -347,6 +415,61 @@ fn debug_fmt(r: &Congestion, f: &mut std::fmt::Formatter) -> std::fmt::Result {
     )
 }
 
+// BBR LOGGING START
+/// Logs the internal state of BBR to a CSV file.
+///
+/// This function is enabled by setting the `QUICHE_BBR_LOG` environment variable.
+fn log_bbr_state(
+    r: &Congestion, path_id: u64, now: Instant, latest_rtt: Duration,
+    bytes_in_flight: usize,
+) {
+    // Check for environment variable to enable logging.
+    if std::env::var("QUICHE_BBR_LOG").is_err() {
+        debug!("[BBR LOGGING DEBUG] QUICHE_BBR_LOG not set, skipping.");
+        return;
+    }
+
+    let bbr = &r.bbr_state;
+    let delivery_rate = r.delivery_rate.sample_delivery_rate();
+
+    // The log format is CSV for easy parsing.
+    let log_line = format!(
+        "{:?},{},{:?},{},{},{},{},{},{},{},{:.2},{:.2},{},{},{},{}\n",
+        now,
+        path_id,
+        bbr.state,
+        bbr.btlbw, // btl_bw in bytes/sec
+        bbr.pacing_rate, // pacing_rate in bytes/sec
+        delivery_rate, // delivery_rate_estimate in bytes/sec
+        bbr.rtprop.as_micros(), // min_rtt in microseconds
+        latest_rtt.as_micros(), // latest_rtt in microseconds
+        r.congestion_window, // cwnd in bytes
+        bytes_in_flight,
+        bbr.pacing_gain,
+        bbr.cwnd_gain,
+        bbr.cycle_index,
+        bbr.newly_lost_bytes,
+        r.app_limited, // is_app_limited
+        0 // app_limited_since (placeholder, not tracked by default)
+    );
+
+    // Open the log file in append mode.
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/minitopo_experiences/bbr_log.csv");
+
+    if let Ok(mut f) = file {
+        // Write the CSV header if the file is new/empty.
+        if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+            let _ = f.write_all(b"timestamp,path_id,bbr_mode,btl_bw,pacing_rate,delivery_rate_estimate,min_rtt_us,latest_rtt_us,cwnd,bytes_in_flight,pacing_gain,cwnd_gain,cycle_idx,newly_lost_bytes,is_app_limited,app_limited_since\n");
+        }
+
+        // Write the log line.
+        let _ = f.write_all(log_line.as_bytes());
+    }
+}
+// BBR LOGGING END
 #[cfg(test)]
 mod tests {
     use super::*;

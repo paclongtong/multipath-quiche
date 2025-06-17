@@ -27,6 +27,8 @@
 use std::str::FromStr;
 use std::time::Instant;
 
+use crate::path;
+
 use super::rtt::RttStats;
 use super::Acked;
 use super::RecoveryConfig;
@@ -34,6 +36,7 @@ use super::Sent;
 
 pub const PACING_MULTIPLIER: f64 = 1.25;
 pub struct Congestion {
+    pub path_id: u64,
     // Congestion control.
     pub(crate) cc_ops: &'static CongestionControlOps,
 
@@ -86,6 +89,8 @@ impl Congestion {
             recovery_config.initial_congestion_window_packets;
 
         let mut cc = Congestion {
+            path_id: 9999,
+
             congestion_window: initial_congestion_window,
 
             ssthresh: usize::MAX,

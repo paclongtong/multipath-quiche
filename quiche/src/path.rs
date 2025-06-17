@@ -296,7 +296,7 @@ impl Path {
 
         let mut r = recovery::Recovery::new_with_config(recovery_config);
         r.path_id = path_id as u64;
-
+        r.congestion.path_id = path_id as u64;
         Self {
             path_id,
             local_addr,
