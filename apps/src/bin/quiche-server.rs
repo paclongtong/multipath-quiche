@@ -577,9 +577,38 @@ fn main() {
         ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr, bool)> {
             conn.path_stats()
                 .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
-                .sorted_by_key(|p| p.min_rtt.unwrap_or(std::time::Duration::MAX))
+                // .sorted_by_key(|p| p.min_rtt.unwrap_or(std::time::Duration::MAX))
+                .sorted_by_key(|p| p.rtt)
                 .enumerate()
                 .map(|(i, p)| (p.local_addr, p.peer_addr, i == 0))
+        }
+
+        fn path_scheduler_hardcoded(
+            conn: &quiche::Connection,
+        ) -> impl Iterator<Item = (std::net::SocketAddr, std::net::SocketAddr, bool)> {
+            let all_paths: Vec<_> = conn
+                .path_stats()
+                .map(|p| (p.local_addr, p.peer_addr))
+                .collect();
+
+            let mut scheduled_paths =
+                Vec::<(std::net::SocketAddr, std::net::SocketAddr, bool)>::new();
+
+            if all_paths.len() >= 2 {
+                // Hardcode path0 to be data path (is_low_latency = false)
+                scheduled_paths.push((all_paths[0].0, all_paths[0].1, false));
+                // Hardcode path1 to be ack path (is_low_latency = true)
+                scheduled_paths.push((all_paths[1].0, all_paths[1].1, true));
+
+                for path in all_paths.iter().skip(2) {
+                    scheduled_paths.push((path.0, path.1, false));
+                }
+            } else if !all_paths.is_empty() {
+                // Fallback for a single path.
+                scheduled_paths.push((all_paths[0].0, all_paths[0].1, true));
+            }
+
+            scheduled_paths.into_iter()
         }
 
 
@@ -774,9 +803,9 @@ fn main() {
                             }
                         }
 
-                        for (pid, path_obj) in client.conn.paths.iter_mut() { // Assuming paths is a HashMap or similar
-                            debug!("Path {}: {:?}", pid, path_obj.stats());
-                        }
+                        // for (pid, path_obj) in client.conn.paths.iter_mut() { // Assuming paths is a HashMap or similar
+                        //     debug!("Path {}: {:?}", pid, path_obj.stats());
+                        // }
                     }
                 }
 

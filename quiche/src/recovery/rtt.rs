@@ -112,6 +112,8 @@ impl RttStats {
 
         self.smoothed_rtt = self.smoothed_rtt * 7 / 8 + adjusted_rtt / 8;
         self.rtt_update_count += 1;
+
+        // debug!("min_rtt: {:?}", self.min_rtt);
     }
 
     pub(crate) fn update_rtt_special(
@@ -121,9 +123,9 @@ impl RttStats {
         self.latest_rtt = latest_rtt + Duration::from_millis(195);
 
         if self.first_rtt_sample.is_none() {
-            self.min_rtt.reset(now, latest_rtt);
-            self.smoothed_rtt = latest_rtt;
-            self.rttvar = (latest_rtt) / 2;
+            self.min_rtt.reset(now, latest_rtt + Duration::from_millis(195));
+            self.smoothed_rtt = latest_rtt + Duration::from_millis(195);
+            self.rttvar = (latest_rtt + Duration::from_millis(195)) / 2;
             self.first_rtt_sample = Some(now);
             return;
         }
