@@ -33,6 +33,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 // BBR LOGGING END
+use log::debug;
 use crate::minmax::Minmax;
 use crate::recovery::*;
 
@@ -323,32 +324,32 @@ fn on_packets_acked(
     // Log BBR state on each ACK event.
     // Note: A placeholder '0' is used for path_id. This should be replaced with
     // a real path identifier from the connection context.
-    // log_bbr_state(r, r.path_id, now, _rtt_stats.latest_rtt, bytes_in_flight);
+    log_bbr_state(r, r.path_id, now, _rtt_stats.latest_rtt, bytes_in_flight);
     // BBR LOGGING END
 
     // DEBUG LOGGING for ACK
-    let bbr = &r.bbr_state;
-    let delivery_rate = r.delivery_rate.sample_delivery_rate();
-    debug!(
-        "BBR_ACK_EVENT: path_id={}, now_ms={}, state={:?}, btlbw={}, pacing_rate={}, delivery_rate={}, rtprop_us={}, latest_rtt_us={}, cwnd={}, bytes_in_flight={}, pacing_gain={:.2}, cwnd_gain={:.2}, cycle_idx={}, newly_lost_bytes={}, app_limited={}, prior_bytes_in_flight={}, newly_acked_bytes={}",
-        r.path_id, // Assuming Congestion has a path_id field
-        (now - bbr.start_time).as_millis(), // Relative time
-        bbr.state,
-        bbr.btlbw,
-        bbr.pacing_rate,
-        delivery_rate,
-        bbr.rtprop.as_micros(),
-        _rtt_stats.latest_rtt.as_micros(),
-        r.congestion_window,
-        bytes_in_flight, // Current bytes_in_flight
-        bbr.pacing_gain,
-        bbr.cwnd_gain,
-        bbr.cycle_index,
-        bbr.newly_lost_bytes, // Will be 0 here as it's reset below
-        r.app_limited,
-        r.bbr_state.prior_bytes_in_flight, // Value before this ACK processing
-        r.bbr_state.newly_acked_bytes
-    );
+    // let bbr = &r.bbr_state;
+    // let delivery_rate = r.delivery_rate.sample_delivery_rate();
+    // debug!(
+    //     "BBR_ACK_EVENT: path_id={}, now_ms={}, state={:?}, btlbw={}, pacing_rate={}, delivery_rate={}, rtprop_us={}, latest_rtt_us={}, cwnd={}, bytes_in_flight={}, pacing_gain={:.2}, cwnd_gain={:.2}, cycle_idx={}, newly_lost_bytes={}, app_limited={}, prior_bytes_in_flight={}, newly_acked_bytes={}",
+    //     r.path_id, // Assuming Congestion has a path_id field
+    //     (now - bbr.start_time).as_millis(), // Relative time
+    //     bbr.state,
+    //     bbr.btlbw,
+    //     bbr.pacing_rate,
+    //     delivery_rate,
+    //     bbr.rtprop.as_micros(),
+    //     _rtt_stats.latest_rtt.as_micros(),
+    //     r.congestion_window,
+    //     bytes_in_flight, // Current bytes_in_flight
+    //     bbr.pacing_gain,
+    //     bbr.cwnd_gain,
+    //     bbr.cycle_index,
+    //     bbr.newly_lost_bytes, // Will be 0 here as it's reset below
+    //     r.app_limited,
+    //     r.bbr_state.prior_bytes_in_flight, // Value before this ACK processing
+    //     r.bbr_state.newly_acked_bytes
+    // );
 
     r.bbr_state.newly_lost_bytes = 0;
 }
@@ -369,30 +370,30 @@ fn congestion_event(
     // Log BBR state on each loss event.
     // Note: RttStats is not available here, so latest_rtt is logged as zero.
     // A placeholder '0' is used for path_id.
-    // log_bbr_state(r, r.path_id, now, Duration::ZERO, bytes_in_flight);
+    log_bbr_state(r, r.path_id, now, Duration::ZERO, bytes_in_flight);
     // BBR LOGGING END
 
     // DEBUG LOGGING for LOSS
-    let bbr = &r.bbr_state;
-    let delivery_rate = r.delivery_rate.sample_delivery_rate();
-    debug!(
-        "BBR_LOSS_EVENT: path_id={}, now_ms={}, state={:?}, btlbw={}, pacing_rate={}, delivery_rate={}, rtprop_us={}, latest_rtt_us=N/A, cwnd={}, bytes_in_flight={}, pacing_gain={:.2}, cwnd_gain={:.2}, cycle_idx={}, newly_lost_bytes={}, app_limited={}",
-        r.path_id, // Assuming Congestion has a path_id field
-        (now - bbr.start_time).as_millis(), // Relative time
-        bbr.state,
-        bbr.btlbw,
-        bbr.pacing_rate,
-        delivery_rate,
-        bbr.rtprop.as_micros(),
-        // latest_rtt is not directly available here, you could pass RttStats if needed
-        r.congestion_window,
-        bytes_in_flight, // bytes_in_flight before accounting for this loss event for cwnd adjustment
-        bbr.pacing_gain,
-        bbr.cwnd_gain,
-        bbr.cycle_index,
-        bbr.newly_lost_bytes, // This is set correctly for the current event
-        r.app_limited
-    );
+    // let bbr = &r.bbr_state;
+    // let delivery_rate = r.delivery_rate.sample_delivery_rate();
+    // debug!(
+    //     "BBR_LOSS_EVENT: path_id={}, now_ms={}, state={:?}, btlbw={}, pacing_rate={}, delivery_rate={}, rtprop_us={}, latest_rtt_us=N/A, cwnd={}, bytes_in_flight={}, pacing_gain={:.2}, cwnd_gain={:.2}, cycle_idx={}, newly_lost_bytes={}, app_limited={}",
+    //     r.path_id, // Assuming Congestion has a path_id field
+    //     (now - bbr.start_time).as_millis(), // Relative time
+    //     bbr.state,
+    //     bbr.btlbw,
+    //     bbr.pacing_rate,
+    //     delivery_rate,
+    //     bbr.rtprop.as_micros(),
+    //     // latest_rtt is not directly available here, you could pass RttStats if needed
+    //     r.congestion_window,
+    //     bytes_in_flight, // bytes_in_flight before accounting for this loss event for cwnd adjustment
+    //     bbr.pacing_gain,
+    //     bbr.cwnd_gain,
+    //     bbr.cycle_index,
+    //     bbr.newly_lost_bytes, // This is set correctly for the current event
+    //     r.app_limited
+    // );
 }
 
 fn checkpoint(_r: &mut Congestion) {}
