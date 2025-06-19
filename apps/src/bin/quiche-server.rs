@@ -99,16 +99,7 @@ fn determine_send_mode(
             Some(true)
         }
         SendMode::TryingData => {
-            // Limit data burst size to preserve ACK responsiveness
-            const MAX_DATA_BURST: usize = 8192; // ~6 packets
-            if path_state.data_burst_size < MAX_DATA_BURST {
-                Some(false)
-            } else {
-                // Reset to ACK mode after burst
-                path_state.mode = SendMode::AckPriority;
-                path_state.data_burst_size = 0;
-                Some(true)
-            }
+            Some(false)
         }
         SendMode::DataOnly => {
             // This shouldn't happen for low-latency paths
@@ -120,24 +111,12 @@ fn determine_send_mode(
 fn update_path_state(
     path_state: &mut PathSendState,
     ack_eliciting_only: Option<bool>,
-    bytes_written: usize,
 ) {
-    match ack_eliciting_only {
-        Some(true) => {
-            // Sent ACKs, can now try data if there's bandwidth
-            if path_state.mode == SendMode::AckPriority {
-                path_state.mode = SendMode::TryingData;
-                path_state.data_burst_size = 0;
-            }
-        }
-        Some(false) => {
-            // Sent data
-            if matches!(path_state.mode, SendMode::TryingData) {
-                path_state.data_burst_size += bytes_written;
-            }
-        }
-        None => {
-            // Mixed or unknown
+    if let Some(true) = ack_eliciting_only {
+        // Sent ACKs, can now try data if there's bandwidth
+        if path_state.mode == SendMode::AckPriority {
+            path_state.mode = SendMode::TryingData;
+            path_state.data_burst_size = 0;
         }
     }
 }
@@ -826,7 +805,7 @@ fn main() {
                                     bytes_left = bytes_left.saturating_sub(write);
 
                                     // Update path state based on what was sent
-                                    update_path_state(path_state, ack_eliciting_only, write);
+                                    update_path_state(path_state, ack_eliciting_only);
                                     if current_path_dst_info.is_none() {
                                         current_path_dst_info = Some(send_info);
                                     }
