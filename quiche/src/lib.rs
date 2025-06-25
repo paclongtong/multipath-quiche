@@ -11430,6 +11430,7 @@ impl Connection {
                 if let Some(path_id) =
                     self.paths.pid_from_path_id(path_identifier)
                 {
+                    let is_server = self.is_server();
                     let is_app_limited =
                         self.delivery_rate_check_if_app_limited(path_id);
                     let p = self.paths.get_mut(path_id)?;
@@ -11445,6 +11446,17 @@ impl Connection {
                             now,
                             &self.trace_id,
                         )?;
+
+                    // let (lost_packets, lost_bytes, acked_bytes) =
+                    //     p.recovery.on_ack_received_calibration(
+                    //         &ranges,
+                    //         ack_delay,
+                    //         epoch,
+                    //         handshake_status,
+                    //         now,
+                    //         &self.trace_id,
+                    //         is_server
+                    //     )?;
                     self.lost_count += lost_packets;
                     self.lost_bytes += lost_bytes as u64;
                     self.acked_bytes += acked_bytes as u64;
