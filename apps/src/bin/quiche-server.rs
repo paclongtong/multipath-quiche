@@ -816,7 +816,12 @@ fn main() {
                                     }
                                 } else { // write == 0, quiche is done for this path/flag for now
                                     // If we were trying to send ACKs, try sending data on the same path now
-                                    if *is_low_latency && path_state.mode == SendMode::AckPriority {
+                                    let addrs_tuple = (*local_addr, *peer_addr);
+                                    let has_cwnd = client.conn.paths.path_id_from_addrs(&addrs_tuple)
+                                        .and_then(|pid| client.conn.paths.get(pid).ok())
+                                        .map_or(false, |path| path.recovery.cwnd_available() > 0);
+
+                                    if *is_low_latency && path_state.mode == SendMode::AckPriority && client.conn.streams.has_flushable() && has_cwnd {
                                         path_state.mode = SendMode::TryingData;
                                         path_state.data_burst_size = 0;
                                         continue 'path_send_loop;

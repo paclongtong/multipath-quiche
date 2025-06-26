@@ -1586,7 +1586,7 @@ pub struct Connection {
     lost_bytes: u64,
 
     /// Streams map, indexed by stream ID.
-    streams: stream::StreamMap,
+    pub streams: stream::StreamMap,
 
     /// Peer's original destination connection ID. Used by the client to
     /// validate the server's transport parameter.
