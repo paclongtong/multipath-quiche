@@ -93,6 +93,10 @@ struct RecoveryEpoch {
 
     acked_frames: Vec<frame::Frame>,
     lost_frames: Vec<frame::Frame>,
+
+    #[cfg(feature = "qlog")]
+    // #[serde(default)]
+    qlog_lost_packets: Vec<EventData>,
 }
 
 struct AckedDetectionResult {
@@ -228,10 +232,10 @@ impl RecoveryEpoch {
         .filter(|p| p.time_acked.is_none() && p.time_lost.is_none());
 
         for unacked in unacked_iter {
+            let reordering_lost = largest_acked >= unacked.pkt_num + pkt_thresh;
+
             // Mark packet as lost, or set time when it should be marked.
-            if unacked.time_sent <= lost_send_time ||
-                largest_acked >= unacked.pkt_num + pkt_thresh
-            {
+            if unacked.time_sent <= lost_send_time || reordering_lost {
                 self.lost_frames.extend(unacked.frames.drain(..));
 
                 unacked.time_lost = Some(now);
@@ -252,6 +256,38 @@ impl RecoveryEpoch {
                     largest_lost_pkt = Some(unacked.clone());
 
                     self.in_flight_count -= 1;
+
+                    #[cfg(feature = "qlog")]
+                    {
+                        use qlog::events::quic::PacketLostTrigger;
+                        let trigger = if reordering_lost {
+                            PacketLostTrigger::ReorderingThreshold
+                        } else {
+                            PacketLostTrigger::TimeThreshold
+                        };
+
+                        let event_data = EventData::PacketLost(
+                            qlog::events::quic::PacketLost {
+                                header: Some(qlog::events::quic::PacketHeader {
+                                    packet_type: unacked.pkt_type.into(),
+                                    packet_number: Some(unacked.pkt_num),
+                                    flags: None,
+                                    token: None,
+                                    length: Some(unacked.size as u16),
+                                    // payload_length: None,
+                                    version: None,
+                                    scil: None,
+                                    dcil: None,
+                                    scid: None,
+                                    dcid: None,
+                                }),
+                                path_id: None,
+                                frames: None,
+                                trigger: Some(trigger),
+                            },
+                        );
+                        self.qlog_lost_packets.push(event_data);
+                    }
 
                     trace!(
                         "{} packet {} lost on epoch {}",
@@ -445,6 +481,13 @@ impl Recovery {
         &mut self, epoch: packet::Epoch,
     ) -> impl Iterator<Item = frame::Frame> + '_ {
         self.epochs[epoch].lost_frames.drain(..)
+    }
+
+    #[cfg(feature = "qlog")]
+    pub fn get_lost_packets(
+        &mut self, epoch: packet::Epoch,
+    ) -> impl Iterator<Item = EventData> + '_ {
+        self.epochs[epoch].qlog_lost_packets.drain(..)
     }
 
     pub fn get_largest_acked_on_epoch(
@@ -1177,7 +1220,7 @@ impl std::fmt::Debug for Recovery {
 pub struct Sent {
     pub pkt_num: u64,
 
-    // pub send_path_id: u64,
+    pub pkt_type: packet::Type,
 
     pub frames: SmallVec<[frame::Frame; 1]>,
 
@@ -1213,7 +1256,7 @@ pub struct Sent {
 impl std::fmt::Debug for Sent {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "pkt_num={:?} ", self.pkt_num)?;
-        // write!(f, "send_path_id={:?} ", self.send_path_id)?; 
+        write!(f, "pkt_type={:?} ", self.pkt_type)?;
         write!(f, "pkt_sent_time={:?} ", self.time_sent)?;
         write!(f, "pkt_size={:?} ", self.size)?;
         write!(f, "delivered={:?} ", self.delivered)?;

@@ -388,6 +388,8 @@ use qlog::events::connectivity::ConnectivityEventType;
 #[cfg(feature = "qlog")]
 use qlog::events::connectivity::TransportOwner;
 #[cfg(feature = "qlog")]
+use qlog::events::quic::PacketType;
+#[cfg(feature = "qlog")]
 use qlog::events::quic::RecoveryEventType;
 #[cfg(feature = "qlog")]
 use qlog::events::quic::TransportEventType;
@@ -488,6 +490,20 @@ pub fn aggregate_pending_ack(conn: &mut Connection) -> Option<AggregatedAck> {
         None
     } else {
         Some(AggregatedAck { ack_ranges: aggregated })
+    }
+}
+
+#[cfg(feature = "qlog")]
+impl From<packet::Type> for PacketType {
+    fn from(t: packet::Type) -> Self {
+        match t {
+            packet::Type::Initial => PacketType::Initial,
+            packet::Type::ZeroRTT => PacketType::ZeroRtt,
+            packet::Type::Handshake => PacketType::Handshake,
+            packet::Type::Retry => PacketType::Retry,
+            packet::Type::Short => PacketType::OneRtt,
+            packet::Type::VersionNegotiation => PacketType::VersionNegotiation,
+        }
     }
 }
 
@@ -1929,6 +1945,10 @@ const QLOG_PACKET_TX: EventType =
     EventType::TransportEventType(TransportEventType::PacketSent);
 
 #[cfg(feature = "qlog")]
+const QLOG_PACKET_LOST: EventType =
+    EventType::RecoveryEventType(RecoveryEventType::PacketLost);
+
+#[cfg(feature = "qlog")]
 const QLOG_DATA_MV: EventType =
     EventType::TransportEventType(TransportEventType::DataMoved);
 
@@ -2245,7 +2265,7 @@ impl Connection {
         &mut self, writer: Box<dyn std::io::Write + Send + Sync>, title: String,
         description: String,
     ) {
-        self.set_qlog_with_level(writer, title, description, QlogLevel::Base)
+        self.set_qlog_with_level(writer, title, description, QlogLevel::Core)
     }
 
     /// Sets qlog output to the designated [`Writer`].
@@ -5133,6 +5153,7 @@ impl Connection {
 
         let sent_pkt = recovery::Sent {
             pkt_num: pn,
+            pkt_type,
             frames,
             time_sent: now,
             time_acked: None,
@@ -6941,6 +6962,7 @@ impl Connection {
 
         let sent_pkt = recovery::Sent {
             pkt_num: pn,
+            pkt_type,
             frames,
             time_sent: now,
             time_acked: None,
@@ -8390,6 +8412,7 @@ impl Connection {
 
         let sent_pkt = recovery::Sent {
             pkt_num: pn,
+            pkt_type,
             frames,
             time_sent: now,
             time_acked: None,
@@ -9732,6 +9755,13 @@ impl Connection {
 
                     self.lost_count += lost_packets;
                     self.lost_bytes += lost_bytes as u64;
+
+                    #[cfg(feature = "qlog")]
+                    qlog_with_type!(QLOG_PACKET_LOST, self.qlog, q, {
+                        for lost in p.recovery.get_lost_packets(packet::Epoch::Application) {
+                            q.add_event_data_with_instant(lost, now).ok();
+                        }
+                    });
 
                     qlog_with_type!(QLOG_METRICS, self.qlog, q, {
                         if let Some(ev_data) = p.recovery.maybe_qlog() {
@@ -11117,6 +11147,13 @@ impl Connection {
                         self.lost_count += lost_packets;
                         self.lost_bytes += lost_bytes as u64;
                         self.acked_bytes += acked_bytes as u64;
+
+                        #[cfg(feature = "qlog")]
+                        qlog_with_type!(QLOG_PACKET_LOST, self.qlog, q, {
+                            for lost in p.recovery.get_lost_packets(epoch) {
+                                q.add_event_data_with_instant(lost, now).ok();
+                            }
+                        });
                     }
                 } else {
                     // This ACK may acknowledge several packets on different
@@ -11146,6 +11183,13 @@ impl Connection {
                         self.lost_count += lost_packets;
                         self.lost_bytes += lost_bytes as u64;
                         self.acked_bytes += acked_bytes as u64;
+
+                        #[cfg(feature = "qlog")]
+                        qlog_with_type!(QLOG_PACKET_LOST, self.qlog, q, {
+                            for lost in p.recovery.get_lost_packets(epoch) {
+                                q.add_event_data_with_instant(lost, now).ok();
+                            }
+                        });
                     }
                 }
             },

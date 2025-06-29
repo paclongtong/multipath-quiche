@@ -844,6 +844,8 @@ pub struct LossTimerUpdated {
 #[serde_with::skip_serializing_none]
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct PacketLost {
+    pub path_id: Option<usize>,
+    
     pub header: Option<PacketHeader>,
 
     pub frames: Option<Vec<QuicFrame>>,

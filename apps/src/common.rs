@@ -773,6 +773,7 @@ pub struct Http3Conn {
     dump_json: bool,
     dgram_sender: Option<Http3DgramSender>,
     output_sink: Rc<RefCell<dyn FnMut(String)>>,
+    put_requests: HashMap<u64, std::io::BufWriter<std::fs::File>>,
 }
 
 impl Http3Conn {
@@ -873,6 +874,7 @@ impl Http3Conn {
             dump_json: dump_json.is_some(),
             dgram_sender,
             output_sink,
+            put_requests: HashMap::new(),
         };
 
         Box::new(h_conn)
@@ -905,6 +907,7 @@ impl Http3Conn {
             dump_json: false,
             dgram_sender,
             output_sink,
+            put_requests: HashMap::new(),
         };
 
         Ok(Box::new(h_conn))
@@ -1431,6 +1434,56 @@ impl HttpConn for Http3Conn {
                     self.largest_processed_request =
                         std::cmp::max(self.largest_processed_request, stream_id);
 
+                    let method = list
+                        .iter()
+                        .find(|h| h.name() == b":method")
+                        .and_then(|h| std::str::from_utf8(h.value()).ok());
+
+                    if method == Some("PUT") {
+                        let path = list
+                            .iter()
+                            .find(|h| h.name() == b":path")
+                            .and_then(|h| {
+                                std::str::from_utf8(h.value()).ok()
+                            })
+                            .unwrap();
+
+                        let mut file_path = path::PathBuf::from(root);
+                        let filename = path.strip_prefix('/').unwrap_or(path);
+                        file_path.push(filename);
+
+                        info!(
+                            "{} creating file for PUT request {:?}",
+                            conn.trace_id(),
+                            file_path
+                        );
+
+                        match std::fs::File::create(&file_path) {
+                            Ok(f) => {
+                                self.put_requests.insert(
+                                    stream_id,
+                                    std::io::BufWriter::new(f),
+                                );
+                            },
+                            Err(e) => {
+                                error!(
+                                    "{} failed to create file {:?}: {}",
+                                    conn.trace_id(),
+                                    file_path,
+                                    e
+                                );
+                                conn.stream_shutdown(
+                                    stream_id,
+                                    quiche::Shutdown::Write,
+                                    H3_MESSAGE_ERROR,
+                                )
+                                .ok();
+                            },
+                        }
+
+                        continue;
+                    }
+
                     // We decide the response based on headers alone, so
                     // stop reading the request stream so that any body
                     // is ignored and pointless Data events are not
@@ -1531,14 +1584,67 @@ impl HttpConn for Http3Conn {
                 },
 
                 Ok((stream_id, quiche::h3::Event::Data)) => {
-                    info!(
-                        "{} got data on stream id {}",
-                        conn.trace_id(),
-                        stream_id
-                    );
+                    if let Some(writer) =
+                        self.put_requests.get_mut(&stream_id)
+                    {
+                        while let Ok(read) =
+                            self.h3_conn.recv_body(conn, stream_id, buf)
+                        {
+                            if read == 0 {
+                                break;
+                            }
+                            info!(
+                                "{} writing {} bytes to file",
+                                conn.trace_id(),
+                                read
+                            );
+                            if let Err(e) = writer.write_all(&buf[..read]) {
+                                error!(
+                                    "{} failed to write to file: {}",
+                                    conn.trace_id(),
+                                    e
+                                );
+                                self.put_requests.remove(&stream_id);
+                                conn.stream_shutdown(
+                                    stream_id,
+                                    quiche::Shutdown::Write,
+                                    H3_MESSAGE_ERROR,
+                                )
+                                .ok();
+                                break;
+                            }
+                        }
+                    } else {
+                        info!(
+                            "{} got data on stream id {}",
+                            conn.trace_id(),
+                            stream_id
+                        );
+                    }
                 },
 
-                Ok((_stream_id, quiche::h3::Event::Finished)) => (),
+                Ok((stream_id, quiche::h3::Event::Finished)) => {
+                    if let Some(mut writer) =
+                        self.put_requests.remove(&stream_id)
+                    {
+                        info!(
+                            "{} finished receiving PUT request on stream {}",
+                            conn.trace_id(),
+                            stream_id
+                        );
+                        writer.flush().ok();
+                        let headers = vec![
+                            quiche::h3::Header::new(b":status", b"200"),
+                            quiche::h3::Header::new(b"server", b"quiche"),
+                        ];
+                        self.h3_conn.send_response(
+                            conn,
+                            stream_id,
+                            &headers,
+                            true,
+                        )?;
+                    }
+                },
 
                 Ok((_stream_id, quiche::h3::Event::Reset { .. })) => (),
 
