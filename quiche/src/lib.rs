@@ -11148,13 +11148,26 @@ impl Connection {
                         self.lost_bytes += lost_bytes as u64;
                         self.acked_bytes += acked_bytes as u64;
 
+                        // #[cfg(feature = "qlog")]
+                        // qlog_with_type!(QLOG_PACKET_LOST, self.qlog, q, {
+                        //     for lost in p.recovery.get_lost_packets(epoch) {
+                        //         q.add_event_data_with_instant(lost, now).ok();
+                        //     }
+                        // });
+                    }
+                    for (_, p) in self
+                        .paths
+                        .iter_mut()
+                    {
                         #[cfg(feature = "qlog")]
                         qlog_with_type!(QLOG_PACKET_LOST, self.qlog, q, {
                             for lost in p.recovery.get_lost_packets(epoch) {
+
                                 q.add_event_data_with_instant(lost, now).ok();
                             }
                         });
                     }
+
                 } else {
                     // This ACK may acknowledge several packets on different
                     // paths.
@@ -22857,6 +22870,7 @@ pub use crate::packet::ConnectionId;
 pub use crate::packet::Header;
 pub use crate::packet::Type;
 
+use crate::path::Path;
 pub use crate::path::PathEvent;
 pub use crate::path::PathState;
 pub use crate::path::PathStats;

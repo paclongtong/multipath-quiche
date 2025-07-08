@@ -108,7 +108,7 @@ impl Rate {
         if self.rate_sample.prior_time.is_none() ||
             pkt.delivered > self.rate_sample.prior_delivered
         {
-            self.rate_sample.prior_delivered = pkt.delivered;
+            self.rate_sample.prior_delivered = pkt.delivered;   // the bytes count of the prior delivered packet
             self.rate_sample.prior_time = Some(pkt.delivered_time);
             self.rate_sample.is_app_limited = pkt.is_app_limited;
             self.rate_sample.send_elapsed =
