@@ -197,6 +197,26 @@ impl Hystart {
         self.window_end = None;
         self.css_start_time = None;
     }
+    
+    pub fn last_round_min_rtt(&self) -> u128 {
+        self.last_round_min_rtt.as_millis()
+    }
+
+    pub fn current_round_min_rtt(&self) -> u128 {
+        self.current_round_min_rtt.as_millis()
+    }
+
+    pub fn rtt_sample_count(&self) -> usize {
+        self.rtt_sample_count
+    }
+
+    pub fn window_end(&self) -> Option<u64> {
+        self.window_end
+    }
+
+    pub fn css_round_count(&self) -> usize {
+        self.css_round_count
+    }
 }
 
 #[cfg(test)]

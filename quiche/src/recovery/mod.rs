@@ -36,16 +36,21 @@ use crate::path;
 use crate::ranges::RangeSet;
 use crate::Config;
 use crate::CongestionControlAlgorithm;
+use crate::QlogInfo;
 use crate::Result;
 
 use crate::frame;
 use crate::packet;
 use crate::ranges;
+use crate::QLOG_PACKET_LOST;
+use qlog::events::EventImportance;
 
 use libc::NDA_CACHEINFO;
 #[cfg(feature = "qlog")]
 use qlog::events::EventData;
 
+#[cfg(feature = "qlog")]
+use qlog::Qlog;
 use smallvec::SmallVec;
 
 use self::congestion::pacer;
@@ -196,7 +201,7 @@ impl RecoveryEpoch {
 
         self.drain_acked_and_lost_packets(now - rtt_stats.rtt());
 
-        AckedDetectionResult {
+        AckedDetectionResult {   //here
             acked_bytes,
             spurious_losses,
             spurious_pkt_thresh,
@@ -207,7 +212,7 @@ impl RecoveryEpoch {
 
     fn detect_lost_packets(
         &mut self, loss_delay: Duration, pkt_thresh: u64, now: Instant,
-        trace_id: &str, epoch: Epoch,
+        trace_id: &str, epoch: Epoch, qlog: &mut QlogInfo,
     ) -> LossDetectionResult {
         self.loss_time = None;
 
@@ -257,8 +262,39 @@ impl RecoveryEpoch {
 
                     self.in_flight_count -= 1;
 
-                    #[cfg(feature = "qlog")]
-                    {
+                    // #[cfg(feature = "qlog")]
+                    // {
+                    //     use qlog::events::quic::PacketLostTrigger;
+                    //     let trigger = if reordering_lost {
+                    //         PacketLostTrigger::ReorderingThreshold
+                    //     } else {
+                    //         PacketLostTrigger::TimeThreshold
+                    //     };
+
+                    //     let event_data = EventData::PacketLost(
+                    //         qlog::events::quic::PacketLost {
+                    //             header: Some(qlog::events::quic::PacketHeader {
+                    //                 packet_type: unacked.pkt_type.into(),
+                    //                 packet_number: Some(unacked.pkt_num),
+                    //                 flags: None,
+                    //                 token: None,
+                    //                 length: Some(unacked.size as u16),
+                    //                 // payload_length: None,
+                    //                 version: None,
+                    //                 scil: None,
+                    //                 dcil: None,
+                    //                 scid: None,
+                    //                 dcid: None,
+                    //             }),
+                    //             path_id: None,
+                    //             frames: None,
+                    //             trigger: Some(trigger),
+                    //         },
+                    //     );
+                    //     self.qlog_lost_packets.push(event_data);
+                    // }
+
+                    qlog_with_type!(QLOG_PACKET_LOST, qlog, q, {
                         use qlog::events::quic::PacketLostTrigger;
                         let trigger = if reordering_lost {
                             PacketLostTrigger::ReorderingThreshold
@@ -286,8 +322,8 @@ impl RecoveryEpoch {
                                 trigger: Some(trigger),
                             },
                         );
-                        self.qlog_lost_packets.push(event_data);
-                    }
+                        q.add_event_data_with_instant(event_data, now).ok();
+                    });
 
                     trace!(
                         "{} packet {} lost on epoch {}",
@@ -393,6 +429,9 @@ pub struct Recovery {
 
     /// A resusable list of acks.
     newly_acked: Vec<Acked>,
+
+    #[cfg(feature = "qlog")]
+    qlog: QlogInfo,
 }
 
 pub struct RecoveryConfig {
@@ -455,6 +494,9 @@ impl Recovery {
             congestion: Congestion::from_config(recovery_config),
 
             newly_acked: Vec::new(),
+
+            #[cfg(feature = "qlog")]
+            qlog: QlogInfo::default(),
         }
     }
 
@@ -564,7 +606,7 @@ impl Recovery {
     pub fn on_ack_received(
         &mut self, ranges: &ranges::RangeSet, ack_delay: u64,
         epoch: packet::Epoch, handshake_status: HandshakeStatus, now: Instant,
-        trace_id: &str,
+        trace_id: &str, qlog: &mut QlogInfo,
     ) -> Result<(usize, usize, usize)> {
         let largest_acked = ranges.last().unwrap();
 
@@ -636,13 +678,14 @@ impl Recovery {
 
         // Detect and mark lost packets without removing them from the sent
         // packets list.
-        let loss = self.detect_lost_packets(epoch, now, trace_id);
+        let loss = self.detect_lost_packets(epoch, now, trace_id, qlog);
 
         self.congestion.on_packets_acked(
             self.bytes_in_flight,
             &mut self.newly_acked,
             &self.rtt_stats,
             now,
+            qlog,
         );
 
         self.bytes_in_flight -= acked_bytes;
@@ -661,7 +704,7 @@ impl Recovery {
     pub fn on_ack_received_calibration(
         &mut self, ranges: &ranges::RangeSet, ack_delay: u64,
         epoch: packet::Epoch, handshake_status: HandshakeStatus, now: Instant,
-        trace_id: &str, is_server: bool
+        trace_id: &str, is_server: bool, qlog: &mut QlogInfo,
     ) -> Result<(usize, usize, usize)> {
         let largest_acked = ranges.last().unwrap();
 
@@ -727,13 +770,14 @@ impl Recovery {
 
         // Detect and mark lost packets without removing them from the sent
         // packets list.
-        let loss = self.detect_lost_packets(epoch, now, trace_id);
+        let loss = self.detect_lost_packets(epoch, now, trace_id, qlog);
 
         self.congestion.on_packets_acked(
             self.bytes_in_flight,
             &mut self.newly_acked,
             &self.rtt_stats,
             now,
+            qlog,
         );
 
         self.bytes_in_flight -= acked_bytes;
@@ -749,13 +793,13 @@ impl Recovery {
     }
     pub fn on_loss_detection_timeout(
         &mut self, handshake_status: HandshakeStatus, now: Instant,
-        trace_id: &str,
+        trace_id: &str, qlog:&mut QlogInfo,
     ) -> (usize, usize) {
         let (earliest_loss_time, epoch) = self.loss_time_and_space();
 
         if earliest_loss_time.is_some() {
             // Time threshold loss detection.
-            let loss = self.detect_lost_packets(epoch, now, trace_id);
+            let loss = self.detect_lost_packets(epoch, now, trace_id, qlog);
 
             self.set_loss_detection_timer(handshake_status, now);
 
@@ -843,10 +887,10 @@ impl Recovery {
     }
 
     pub fn on_path_change(
-        &mut self, epoch: packet::Epoch, now: Instant, trace_id: &str,
+        &mut self, epoch: packet::Epoch, now: Instant, trace_id: &str, qlog: &mut QlogInfo,
     ) -> (usize, usize) {
         // Time threshold loss detection.
-        self.detect_lost_packets(epoch, now, trace_id)
+        self.detect_lost_packets(epoch, now, trace_id, qlog)
     }
 
     pub fn loss_detection_timer(&self) -> Option<Instant> {
@@ -1063,6 +1107,7 @@ impl Recovery {
                     epoch_lost_bytes,
                     &pkt,
                     now,
+                    &mut self.qlog,
                 );
 
                 self.bytes_in_flight -= epoch_lost_bytes;
@@ -1073,7 +1118,7 @@ impl Recovery {
     }
 
     fn detect_lost_packets(
-        &mut self, epoch: packet::Epoch, now: Instant, trace_id: &str,
+        &mut self, epoch: packet::Epoch, now: Instant, trace_id: &str, qlog: &mut QlogInfo,
     ) -> (usize, usize) {
         let loss_delay = cmp::max(self.rtt_stats.latest_rtt, self.rtt())
             .mul_f64(self.time_thresh);
@@ -1084,6 +1129,7 @@ impl Recovery {
             now,
             trace_id,
             epoch,
+            qlog,
         );
 
         if let Some(pkt) = loss.largest_lost_pkt {
@@ -1097,6 +1143,7 @@ impl Recovery {
                 loss.lost_bytes,
                 &pkt,
                 now,
+                qlog,
             );
 
             self.bytes_in_flight -= loss.lost_bytes;
@@ -1485,6 +1532,7 @@ mod tests {
 
         // Start by sending a few packets.
         let p = Sent {
+            pkt_type: packet::Type::Short,
             pkt_num: 0,
             frames: smallvec![],
             time_sent: now,
@@ -1515,6 +1563,7 @@ mod tests {
         assert_eq!(r.bytes_in_flight, 1000);
 
         let p = Sent {
+            pkt_type: packet::Type::Short,
             pkt_num: 1,
             frames: smallvec![],
             time_sent: now,
@@ -1545,6 +1594,7 @@ mod tests {
         assert_eq!(r.bytes_in_flight, 2000);
 
         let p = Sent {
+            pkt_type: packet::Type::Short,
             pkt_num: 2,
             frames: smallvec![],
             time_sent: now,
@@ -1574,6 +1624,7 @@ mod tests {
         assert_eq!(r.bytes_in_flight, 3000);
 
         let p = Sent {
+            pkt_type: packet::Type::Short,
             pkt_num: 3,
             frames: smallvec![],
             time_sent: now,

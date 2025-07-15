@@ -27,7 +27,11 @@
 use std::str::FromStr;
 use std::time::Instant;
 
+use qlog::Qlog;
+
 use crate::path;
+#[cfg(feature = "qlog")]
+use crate::QlogInfo;
 
 use super::rtt::RttStats;
 use super::Acked;
@@ -81,6 +85,9 @@ pub struct Congestion {
     max_datagram_size: usize,
 
     pub(crate) lost_count: usize,
+
+    #[cfg(feature = "qlog")]
+    pub(crate) qlog: QlogInfo,
 }
 
 impl Congestion {
@@ -133,6 +140,9 @@ impl Congestion {
             bbr_state: bbr::State::new(),
 
             bbr2_state: bbr2::State::new(),
+
+            #[cfg(feature = "qlog")]
+            qlog: QlogInfo::default(),
         };
 
         (cc.cc_ops.on_init)(&mut cc);
@@ -209,7 +219,7 @@ impl Congestion {
 
     pub(crate) fn on_packets_acked(
         &mut self, bytes_in_flight: usize, acked: &mut Vec<Acked>,
-        rtt_stats: &RttStats, now: Instant,
+        rtt_stats: &RttStats, now: Instant, qlog: &mut QlogInfo,
     ) {
         // Update delivery rate sample per acked packet.
         for pkt in acked.iter() {
@@ -226,6 +236,7 @@ impl Congestion {
             acked,
             now,
             rtt_stats,
+            qlog,
         );
     }
 
@@ -302,6 +313,7 @@ pub(crate) struct CongestionControlOps {
         packets: &mut Vec<Acked>,
         now: Instant,
         rtt_stats: &RttStats,
+        qlog: &mut QlogInfo,
     ),
 
     pub congestion_event: fn(
@@ -310,6 +322,7 @@ pub(crate) struct CongestionControlOps {
         lost_bytes: usize,
         largest_lost_packet: &Sent,
         now: Instant,
+        qlog: &mut QlogInfo,
     ),
 
     pub checkpoint: fn(r: &mut Congestion),

@@ -30,6 +30,7 @@
 
 use std::cmp;
 use std::time::Instant;
+use crate::QlogInfo;
 
 use crate::recovery;
 
@@ -61,7 +62,7 @@ pub fn on_packet_sent(
 
 fn on_packets_acked(
     r: &mut Congestion, _bytes_in_flight: usize, packets: &mut Vec<Acked>,
-    now: Instant, rtt_stats: &RttStats,
+    now: Instant, rtt_stats: &RttStats, qlog: &mut QlogInfo
 ) {
     for pkt in packets.drain(..) {
         on_packet_acked(r, &pkt, now, rtt_stats);
@@ -107,7 +108,7 @@ fn on_packet_acked(
 
 fn congestion_event(
     r: &mut Congestion, _bytes_in_flight: usize, _lost_bytes: usize,
-    largest_lost_pkt: &Sent, now: Instant,
+    largest_lost_pkt: &Sent, now: Instant, qlog: &mut QlogInfo
 ) {
     // Start a new congestion event if packet was sent after the
     // start of the previous congestion recovery period.

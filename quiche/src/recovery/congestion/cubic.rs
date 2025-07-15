@@ -36,14 +36,40 @@ use std::cmp;
 use std::time::Duration;
 use std::time::Instant;
 
+use qlog::events::EventData;
+#[cfg(feature = "qlog")]
+use qlog::events::EventType;
+#[cfg(feature = "qlog")]
+use qlog::events::EventImportance;
+use ring::aead::Nonce;
 use crate::recovery;
 use crate::recovery::rtt::RttStats;
 use crate::recovery::Acked;
 use crate::recovery::Sent;
+use crate::QlogInfo;
 
 use super::reno;
 use super::Congestion;
 use super::CongestionControlOps;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub enum CubicState {
+    #[default]
+    SlowStart,
+    // Hystart's conservative probing phase.
+    ConservativeSlowStart,
+    // The standard CUBIC function.
+    CongestionAvoidance,
+    // State after a loss event.
+    Recovery,
+}
+
+// Helper to convert the enum to a string for qlogging
+impl std::fmt::Display for CubicState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
 
 pub(crate) static CUBIC: CongestionControlOps = CongestionControlOps {
     on_init,
@@ -95,6 +121,8 @@ pub struct State {
 
     // CUBIC state checkpoint preceding the last congestion event.
     prior: PriorState,
+
+    state: CubicState,
 }
 
 /// Stores the CUBIC state from before the last congestion event.
@@ -176,18 +204,52 @@ fn on_packet_sent(
 
 fn on_packets_acked(
     r: &mut Congestion, bytes_in_flight: usize, packets: &mut Vec<Acked>,
-    now: Instant, rtt_stats: &RttStats,
+    now: Instant, rtt_stats: &RttStats, qlog: &mut QlogInfo
 ) {
     for pkt in packets.drain(..) {
-        on_packet_acked(r, bytes_in_flight, &pkt, now, rtt_stats);
+        on_packet_acked(r, bytes_in_flight, &pkt, now, rtt_stats, qlog);
     }
 }
 
+#[cfg(feature = "qlog")]
+const QLOG_CUBIC_STATE_UPDATED: EventType = 
+    EventType::ConnectivityEventType(qlog::events::connectivity::ConnectivityEventType::CubicStateUpdate);
+
 fn on_packet_acked(
     r: &mut Congestion, bytes_in_flight: usize, packet: &Acked, now: Instant,
-    rtt_stats: &RttStats,
+    rtt_stats: &RttStats, qlog: &mut QlogInfo
 ) {
     let in_congestion_recovery = r.in_congestion_recovery(packet.time_sent);
+
+    if r.cubic_state.state == CubicState::Recovery && !in_congestion_recovery {
+        let old_state = r.cubic_state.state;
+        r.cubic_state.state = CubicState::CongestionAvoidance;
+
+        qlog_with_type!(QLOG_CUBIC_STATE_UPDATED, qlog, q, {
+            let ev_data = Some(
+                EventData::CubicStateUpdate(
+                    qlog::events::connectivity::CubicStateUpdate {
+                    path_id: r.path_id,
+                    old_state: old_state.to_string(),
+                    new_state: r.cubic_state.state.to_string(),
+                    trigger: "recovery_exit".to_string(),
+                    data: qlog::events::connectivity::CubicStateUpdateData {
+                        cwnd: r.congestion_window as u64,
+                        ssthresh: r.ssthresh as u64,
+                        w_max: r.cubic_state.w_max as u64,
+                        hystart_window_end: None,
+                        hystart_last_min_rtt: None,
+                        hystart_current_min_rtt: None,
+                        hystart_rtt_sample_count: Some(r.hystart.rtt_sample_count()),
+                        hystart_in_css: None,
+                        hystart_css_round_count: Some(r.hystart.css_round_count()),
+                    },
+                })
+            );
+            q.add_event_data_with_instant(ev_data.unwrap(), now).ok();
+        });
+        
+    }
 
     if in_congestion_recovery {
         r.prr.on_packet_acked(
@@ -243,9 +305,69 @@ fn on_packet_acked(
             r.bytes_acked_sl -= r.max_datagram_size;
         }
 
+        if r.cubic_state.state == CubicState::SlowStart && r.hystart.in_css() {
+            let old_state = r.cubic_state.state;
+            r.cubic_state.state = CubicState::ConservativeSlowStart;
+
+            qlog_with_type!(QLOG_CUBIC_STATE_UPDATED, qlog, q, {
+                let ev_data = Some(
+                    EventData::CubicStateUpdate(
+                        qlog::events::connectivity::CubicStateUpdate {
+                        path_id: r.path_id,
+                        old_state: old_state.to_string(),
+                        new_state: r.cubic_state.state.to_string(),
+                        trigger: "hystart_rtt_increase".to_string(),
+                        data: qlog::events::connectivity::CubicStateUpdateData {
+                            cwnd: r.congestion_window as u64,
+                            ssthresh: r.ssthresh as u64,
+                            w_max: r.cubic_state.w_max as u64,
+                            hystart_window_end: r.hystart.window_end(),
+                            hystart_last_min_rtt: Some(r.hystart.last_round_min_rtt()),
+                            hystart_current_min_rtt: Some(r.hystart.current_round_min_rtt()),
+                            hystart_rtt_sample_count: Some(r.hystart.rtt_sample_count()),
+                            hystart_in_css: Some(r.hystart.in_css()),
+                            hystart_css_round_count: Some(r.hystart.css_round_count()),
+
+                        },
+                    })
+                );
+                q.add_event_data_with_instant(ev_data.unwrap(), now).ok();
+            });        
+
+        }
+
         if r.hystart.on_packet_acked(packet, rtt_stats.latest_rtt, now) {
             // Exit to congestion avoidance if CSS ends.
             r.ssthresh = r.congestion_window;
+            debug!("hystart.on_packet_acked() returns true, should enter CA");
+            if r.cubic_state.state == CubicState::SlowStart || r.cubic_state.state == CubicState::ConservativeSlowStart {
+                let old_state = r.cubic_state.state;
+                r.cubic_state.state = CubicState::CongestionAvoidance;
+
+                qlog_with_type!(QLOG_CUBIC_STATE_UPDATED, qlog, q, {
+                    let ev_data = Some(
+                        EventData::CubicStateUpdate(
+                            qlog::events::connectivity::CubicStateUpdate {
+                            path_id: r.path_id,
+                            old_state: old_state.to_string(),
+                            new_state: r.cubic_state.state.to_string(),
+                            trigger: "hystart_rtt_increase".to_string(),
+                            data: qlog::events::connectivity::CubicStateUpdateData {
+                                cwnd: r.congestion_window as u64,
+                                ssthresh: r.ssthresh as u64,
+                                w_max: r.cubic_state.w_max as u64,
+                                hystart_window_end: r.hystart.window_end(),
+                                hystart_last_min_rtt: Some(r.hystart.last_round_min_rtt()),
+                                hystart_current_min_rtt: Some(r.hystart.current_round_min_rtt()),
+                                hystart_rtt_sample_count: Some(r.hystart.rtt_sample_count()),
+                                hystart_in_css: Some(r.hystart.in_css()),
+                                hystart_css_round_count: Some(r.hystart.css_round_count()),
+                            },
+                        })
+                    );
+                    q.add_event_data_with_instant(ev_data.unwrap(), now).ok();
+                });
+            }
         }
     } else {
         // Congestion avoidance.
@@ -324,12 +446,41 @@ fn on_packet_acked(
             r.congestion_window += r.max_datagram_size;
             r.cubic_state.cwnd_inc -= r.max_datagram_size;
         }
+
+        if r.cubic_state.state == CubicState::SlowStart || r.cubic_state.state == CubicState::ConservativeSlowStart {
+            let old_state = r.cubic_state.state;
+            r.cubic_state.state = CubicState::CongestionAvoidance;
+
+            qlog_with_type!(QLOG_CUBIC_STATE_UPDATED, qlog, q, {
+                let ev_data = Some(
+                    EventData::CubicStateUpdate(
+                        qlog::events::connectivity::CubicStateUpdate {
+                        path_id: r.path_id,
+                        old_state: old_state.to_string(),
+                        new_state: r.cubic_state.state.to_string(),
+                        trigger: "ssthresh_exceeded".to_string(),
+                        data: qlog::events::connectivity::CubicStateUpdateData {
+                            cwnd: r.congestion_window as u64,
+                            ssthresh: r.ssthresh as u64,
+                            w_max: r.cubic_state.w_max as u64,
+                            hystart_window_end: r.hystart.window_end(),
+                            hystart_last_min_rtt: Some(r.hystart.last_round_min_rtt()),
+                            hystart_current_min_rtt: Some(r.hystart.current_round_min_rtt()),
+                            hystart_rtt_sample_count: Some(r.hystart.rtt_sample_count()),
+                            hystart_in_css: Some(r.hystart.in_css()),
+                            hystart_css_round_count: Some(r.hystart.css_round_count()),
+                        },
+                    })
+                );
+                q.add_event_data_with_instant(ev_data.unwrap(), now).ok();
+            });
+        }
     }
 }
 
 fn congestion_event(
     r: &mut Congestion, bytes_in_flight: usize, _lost_bytes: usize,
-    largest_lost_pkt: &Sent, now: Instant,
+    largest_lost_pkt: &Sent, now: Instant, qlog: &mut QlogInfo
 ) {
     let time_sent = largest_lost_pkt.time_sent;
     let in_congestion_recovery = r.in_congestion_recovery(time_sent);
@@ -371,7 +522,63 @@ fn congestion_event(
             r.hystart.congestion_event();
         }
 
+        let old_state = r.cubic_state.state;
+        r.cubic_state.state = CubicState::Recovery;
+    
+        qlog_with_type!(QLOG_CUBIC_STATE_UPDATED, qlog, q, {
+            let ev_data = Some(
+                EventData::CubicStateUpdate(
+                    qlog::events::connectivity::CubicStateUpdate {
+                    path_id: r.path_id,
+                    old_state: old_state.to_string(),
+                    new_state: r.cubic_state.state.to_string(),
+                    trigger: "packet_loss".to_string(),
+                    data: qlog::events::connectivity::CubicStateUpdateData {
+                        cwnd: r.congestion_window as u64,
+                        ssthresh: r.ssthresh as u64,
+                        w_max: r.cubic_state.w_max as u64,
+                        hystart_window_end: None,
+                        hystart_last_min_rtt: None,
+                        hystart_current_min_rtt: None,
+                        hystart_rtt_sample_count: None,
+                        hystart_in_css: None,
+                        hystart_css_round_count: None,
+                    },
+                })
+            );
+            q.add_event_data_with_instant(ev_data.unwrap(), now).ok();
+        });
+
         r.prr.congestion_event(bytes_in_flight);
+    }
+
+    if r.cubic_state.state != CubicState::Recovery {
+        let old_state = r.cubic_state.state;
+        r.cubic_state.state = CubicState::Recovery;
+    
+        qlog_with_type!(QLOG_CUBIC_STATE_UPDATED, qlog, q, {
+            let ev_data = Some(
+                EventData::CubicStateUpdate(
+                    qlog::events::connectivity::CubicStateUpdate {
+                    path_id: r.path_id,
+                    old_state: old_state.to_string(),
+                    new_state: r.cubic_state.state.to_string(),
+                    trigger: "congestion_event".to_string(),
+                    data: qlog::events::connectivity::CubicStateUpdateData {
+                        cwnd: r.congestion_window as u64,
+                        ssthresh: r.ssthresh as u64,
+                        w_max: r.cubic_state.w_max as u64,
+                        hystart_window_end: None,
+                        hystart_last_min_rtt: None,
+                        hystart_current_min_rtt: None,
+                        hystart_rtt_sample_count: None,
+                        hystart_in_css: None,
+                        hystart_css_round_count: None,
+                    },
+                })
+            );
+            q.add_event_data_with_instant(ev_data.unwrap(), now).ok();
+        });
     }
 }
 

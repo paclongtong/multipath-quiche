@@ -4,7 +4,7 @@
 **/*.*qlog
 target/release/original/
 target/release/separate_stream_ack/
-apps/src/bin/root/
+**/apps/src/bin/root/
 # Ignore Rust build artifacts
 /target/
 

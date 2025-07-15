@@ -298,7 +298,7 @@ fn on_packet_sent(
 
 fn on_packets_acked(
     r: &mut Congestion, bytes_in_flight: usize, packets: &mut Vec<Acked>,
-    now: Instant, _rtt_stats: &RttStats,
+    now: Instant, _rtt_stats: &RttStats, qlog: &mut QlogInfo
 ) {
     r.bbr_state.prior_bytes_in_flight = bytes_in_flight;
 
@@ -356,7 +356,7 @@ fn on_packets_acked(
 
 fn congestion_event(
     r: &mut Congestion, bytes_in_flight: usize, lost_bytes: usize,
-    largest_lost_pkt: &Sent, now: Instant,
+    largest_lost_pkt: &Sent, now: Instant, qlog: &mut QlogInfo
 ) {
     r.bbr_state.newly_lost_bytes = lost_bytes;
 

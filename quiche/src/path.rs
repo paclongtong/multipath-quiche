@@ -37,6 +37,7 @@ use slab::Slab;
 use crate::CIDSeq;
 use crate::Error;
 use crate::PathId;
+use crate::QlogInfo;
 use crate::Result;
 
 use crate::pmtud;
@@ -587,12 +588,13 @@ impl Path {
 
     pub fn on_loss_detection_timeout(
         &mut self, handshake_status: HandshakeStatus, now: time::Instant,
-        is_server: bool, trace_id: &str,
+        is_server: bool, trace_id: &str, qlog: &mut QlogInfo
     ) -> (usize, usize) {
         let (lost_packets, lost_bytes) = self.recovery.on_loss_detection_timeout(
             handshake_status,
             now,
             trace_id,
+            qlog,
         );
 
         let mut lost_probe_time = None;

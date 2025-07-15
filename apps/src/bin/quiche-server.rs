@@ -91,7 +91,7 @@ fn main() {
 
     info!("listening on {:}", socket.local_addr().unwrap());
 
-    // pacing = false; // temporary change for testing the pacing issue
+    pacing = false; // temporary change for testing the pacing issue
 
     poll.registry()
         .register(&mut socket, mio::Token(0), mio::Interest::READABLE)

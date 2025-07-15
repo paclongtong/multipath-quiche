@@ -1961,7 +1961,7 @@ const QLOG_CONNECTION_CLOSED: EventType =
     EventType::ConnectivityEventType(ConnectivityEventType::ConnectionClosed);
 
 #[cfg(feature = "qlog")]
-struct QlogInfo {
+pub struct QlogInfo {
     streamer: Option<qlog::streamer::QlogStreamer>,
     logged_peer_params: bool,
     level: EventImportance,
@@ -1973,7 +1973,7 @@ impl Default for QlogInfo {
         QlogInfo {
             streamer: None,
             logged_peer_params: false,
-            level: EventImportance::Base,
+            level: EventImportance::Core,
         }
     }
 }
@@ -9751,6 +9751,7 @@ impl Connection {
                         now,
                         self.is_server,
                         &self.trace_id,
+                        &mut self.qlog,
                     );
 
                     self.lost_count += lost_packets;
@@ -9758,8 +9759,10 @@ impl Connection {
 
                     #[cfg(feature = "qlog")]
                     qlog_with_type!(QLOG_PACKET_LOST, self.qlog, q, {
-                        for lost in p.recovery.get_lost_packets(packet::Epoch::Application) {
-                            q.add_event_data_with_instant(lost, now).ok();
+                        for epoch in [packet::Epoch::Initial, packet::Epoch::Handshake, packet::Epoch::Application] {
+                            for lost in p.recovery.get_lost_packets(epoch) {
+                                q.add_event_data_with_instant(lost, now).ok();
+                            }
                         }
                     });
 
@@ -11143,6 +11146,7 @@ impl Connection {
                                 handshake_status,
                                 now,
                                 &self.trace_id,
+                                &mut self.qlog,
                             )?;
                         self.lost_count += lost_packets;
                         self.lost_bytes += lost_bytes as u64;
@@ -11191,6 +11195,7 @@ impl Connection {
                                 handshake_status,
                                 now,
                                 &self.trace_id,
+                                &mut self.qlog,
                             )?;
 
                         self.lost_count += lost_packets;
@@ -11707,6 +11712,7 @@ impl Connection {
                             handshake_status,
                             now,
                             &self.trace_id,
+                            &mut self.qlog,
                         )?;
 
                     // let (lost_packets, lost_bytes, acked_bytes) =
@@ -12580,7 +12586,7 @@ impl Connection {
             ) {
                 let (lost_packets, lost_bytes) = old_active_path
                     .recovery
-                    .on_path_change(e, now, &self.trace_id);
+                    .on_path_change(e, now, &self.trace_id, &mut self.qlog);
 
                 self.lost_count += lost_packets;
                 self.lost_bytes += lost_bytes as u64;

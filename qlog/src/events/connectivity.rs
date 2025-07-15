@@ -62,6 +62,7 @@ pub enum ConnectivityEventType {
     SpinBitUpdated,
     ConnectionStateUpdated,
     MtuUpdated,
+    CubicStateUpdate,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -144,4 +145,30 @@ pub struct MtuUpdated {
     pub old: Option<u16>,
     pub new: u16,
     pub done: Option<bool>,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct CubicStateUpdateData {
+    pub cwnd: u64,
+    pub ssthresh: u64,
+    pub w_max: u64,
+    pub hystart_window_end: Option<u64>,
+    pub hystart_last_min_rtt: Option<u128>,
+    pub hystart_current_min_rtt: Option<u128>,
+    // pub hystart_rtt_threshold: Option<u64>,
+    pub hystart_rtt_sample_count: Option<usize>,
+    pub hystart_in_css: Option<bool>,
+    pub hystart_css_round_count: Option<usize>,
+
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct CubicStateUpdate {
+    pub path_id: u64,
+    pub old_state: String,
+    pub new_state: String,
+    pub trigger: String,
+    pub data: CubicStateUpdateData,
 }
