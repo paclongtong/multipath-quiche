@@ -338,6 +338,7 @@ Options:
   --qpack-blocked-streams STREAMS   Limit of blocked streams while decoding. Any value other that 0 is currently unsupported.
   --session-file PATH      File used to cache a TLS session for resumption.
   --source-port PORT       Source port to use when connecting to the server [default: 0].
+  --disable-pacing         Disable pacing.
   --initial-cwnd-packets PACKETS   The initial congestion window size in terms of packet count [default: 10].
   -h --help                Show this screen.
 ";
@@ -364,6 +365,7 @@ pub struct ClientArgs {
     pub rm_addrs: Vec<(std::time::Duration, SocketAddr)>,
     pub status: Vec<(std::time::Duration, SocketAddr, bool)>,
     pub retire_dcids: Vec<(std::time::Duration, PathId, CIDSeq)>,
+    pub disable_pacing: bool,
 }
 
 impl Args for ClientArgs {
@@ -447,6 +449,8 @@ impl Args for ClientArgs {
         let perform_migration = args.get_bool("--perform-migration");
 
         let send_priority_update = args.get_bool("--send-priority-update");
+
+        let disable_pacing = args.get_bool("--disable-pacing");
 
         let addrs = args
             .get_vec("--address")
@@ -544,6 +548,7 @@ impl Args for ClientArgs {
             rm_addrs,
             status,
             retire_dcids,
+            disable_pacing,
         }
     }
 }
@@ -571,6 +576,7 @@ impl Default for ClientArgs {
             rm_addrs: vec![],
             status: vec![],
             retire_dcids: vec![],
+            disable_pacing: false,
         }
     }
 }

@@ -175,6 +175,8 @@ pub fn connect(
         config.enable_dgram(true, 1000, 1000);
     }
 
+    config.enable_pacing(!args.disable_pacing);
+
     let mut http_conn: Option<Box<dyn HttpConn>> = None;
 
     let mut app_proto_selected = false;
