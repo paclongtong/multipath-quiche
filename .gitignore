@@ -7,6 +7,6 @@ target/release/separate_stream_ack/
 **/apps/src/bin/root/
 # Ignore Rust build artifacts
 /target/
-
+CLAUDE.md
 # Ignore Git submodule packs
 .git/modules/
