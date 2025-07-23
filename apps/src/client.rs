@@ -28,7 +28,9 @@ use crate::args::*;
 use crate::common::*;
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::net::ToSocketAddrs;
+use std::time::{Duration, Instant};
 
 use std::io::prelude::*;
 
@@ -53,6 +55,160 @@ pub enum ClientError {
 pub enum SubPacketType {
     Data,
     Ack,
+}
+
+#[derive(Debug)]
+pub struct ProbingMetrics {
+    pub path1_cwnd_history: VecDeque<(Instant, u64)>,
+    pub path1_rtt_samples: usize,
+    pub ping_frames_sent: u64,
+    pub ping_frames_acked: u64,
+    pub last_ping_time: Option<Instant>,
+    pub ack_eliciting_ratio: f64,
+}
+
+impl ProbingMetrics {
+    pub fn new() -> Self {
+        ProbingMetrics {
+            path1_cwnd_history: VecDeque::new(),
+            path1_rtt_samples: 0,
+            ping_frames_sent: 0,
+            ping_frames_acked: 0,
+            last_ping_time: None,
+            ack_eliciting_ratio: 0.0,
+        }
+    }
+
+    pub fn update_cwnd(&mut self, cwnd: u64, now: Instant) {
+        self.path1_cwnd_history.push_back((now, cwnd));
+        // Keep only recent history (last 30 seconds)
+        while let Some(&(time, _)) = self.path1_cwnd_history.front() {
+            if now.duration_since(time) > Duration::from_secs(30) {
+                self.path1_cwnd_history.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn record_ping_sent(&mut self, now: Instant) {
+        self.ping_frames_sent += 1;
+        self.last_ping_time = Some(now);
+    }
+
+    pub fn can_send_ping(&self, now: Instant, min_interval: Duration) -> bool {
+        // Enforce minimum interval between PING frames
+        if let Some(last_ping) = self.last_ping_time {
+            if now.duration_since(last_ping) < min_interval {
+                return false;
+            }
+        }
+        
+        // Don't send more PINGs if success rate is too low
+        if self.ping_frames_sent > 0 {
+            let success_rate = self.ping_frames_acked as f64 / self.ping_frames_sent as f64;
+            if success_rate < 0.5 && self.ping_frames_sent >= 3 {
+                return false; // Stop probing if less than 50% success after 3 attempts
+            }
+        }
+        
+        true
+    }
+
+    pub fn update_effectiveness(&mut self, conn: &quiche::Connection) {
+        // Calculate CWND growth rate and other metrics for the low-latency path
+        if let Some(low_latency_stats) = conn.path_stats().min_by_key(|p| p.rtt) {
+            self.path1_rtt_samples = low_latency_stats.rtt_update;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct EarlyPhaseDetector {
+    connection_start: Instant,
+    path_cwnd_samples: HashMap<u64, Vec<u64>>,
+    rtt_sample_counts: HashMap<u64, usize>,
+    initial_probing_duration: Duration,
+    cwnd_ratio_threshold: f64,
+}
+
+impl EarlyPhaseDetector {
+    pub fn new(probing_duration_ms: u64, cwnd_ratio_threshold: f64) -> Self {
+        EarlyPhaseDetector {
+            connection_start: Instant::now(),
+            path_cwnd_samples: HashMap::new(),
+            rtt_sample_counts: HashMap::new(),
+            initial_probing_duration: Duration::from_millis(probing_duration_ms),
+            cwnd_ratio_threshold,
+        }
+    }
+
+    pub fn needs_active_probing(&mut self, conn: &quiche::Connection) -> bool {
+        // Condition 1: Time-based (early connection phase)
+        let connection_age = Instant::now().duration_since(self.connection_start);
+        let is_early_time = connection_age < self.initial_probing_duration;
+        
+        if !is_early_time {
+            return false;
+        }
+
+        // Get paths sorted by RTT (low-latency first, high-bandwidth last)
+        let mut path_stats: Vec<_> = conn.path_stats().collect();
+        path_stats.sort_by_key(|p| p.rtt);
+        
+        if path_stats.len() < 2 {
+            return false; // Need at least 2 paths for meaningful probing
+        }
+
+        // Update RTT sample counts
+        for path_stat in &path_stats {
+            self.rtt_sample_counts.insert(path_stat.path_id, path_stat.rtt_update);
+        }
+        
+        let low_latency_path = &path_stats[0];  // Lowest RTT (ACK path)
+        let high_bandwidth_path = &path_stats[path_stats.len() - 1];  // Highest RTT (data path)
+        
+        // Condition 2: CWND disparity (low-latency path significantly smaller)
+        let cwnd_ratio = if high_bandwidth_path.cwnd > 0 { 
+            low_latency_path.cwnd as f64 / high_bandwidth_path.cwnd as f64 
+        } else { 
+            1.0 
+        };
+        let needs_cwnd_boost = cwnd_ratio < self.cwnd_ratio_threshold;
+        
+        // Condition 3: RTT sample disparity  
+        let high_bw_samples = self.rtt_sample_counts.get(&high_bandwidth_path.path_id).unwrap_or(&0);
+        let low_lat_samples = self.rtt_sample_counts.get(&low_latency_path.path_id).unwrap_or(&0);
+        let sample_disparity = *high_bw_samples > *low_lat_samples * 2;
+        
+        needs_cwnd_boost || sample_disparity
+    }
+
+    pub fn get_probing_frequency(&self, conn: &quiche::Connection) -> f64 {
+        let base_freq = 0.05; // Much more conservative: 5% of ACK packets get PING
+        let connection_age = Instant::now().duration_since(self.connection_start);
+        
+        // Time decay factor - reduces probing frequency over time
+        let time_factor = if connection_age < self.initial_probing_duration {
+            let progress = connection_age.as_secs_f64() / self.initial_probing_duration.as_secs_f64();
+            (1.0 - progress * 0.9).max(0.1) // Decay from 100% to 10%
+        } else {
+            0.01 // Very minimal probing after initial phase
+        };
+        
+        // CWND factor - only boost if CWND is very low
+        let cwnd_factor = if let Some(low_latency_stats) = conn.path_stats().min_by_key(|p| p.rtt) {
+            if low_latency_stats.cwnd < 5 * 1200 { // Less than 5 MSS
+                1.5
+            } else {
+                1.0
+            }
+        } else {
+            1.0
+        };
+        
+        (base_freq * time_factor * cwnd_factor).min(0.1) // Cap at 10% instead of 50%
+    }
 }
 
 pub fn connect(
@@ -264,6 +420,15 @@ pub fn connect(
     let mut scid_sent = false;
     let mut new_path_probed = false;
     let mut migrated = false;
+
+    // Initialize early phase detector if probing is enabled
+    let mut early_phase_detector = if args.enable_early_path_probing {
+        Some(EarlyPhaseDetector::new(args.probing_duration_ms, args.cwnd_ratio_threshold))
+    } else {
+        None
+    };
+
+    let mut probing_metrics = ProbingMetrics::new();
 
     loop {
         if !conn.is_in_early_data() || app_proto_selected {
@@ -572,6 +737,16 @@ pub fn connect(
         let scheduled_tuples = lowest_latency_scheduler_flagged(&conn).collect::<Vec<_>>();
         // let scheduled_tuples = path_scheduler_hardcoded(&conn).collect::<Vec<_>>();
         debug!("scheduled_tuples:{:?}", scheduled_tuples);
+        // Update probing metrics and early phase detection
+        if args.enable_early_path_probing {
+            probing_metrics.update_effectiveness(&conn);
+            
+            // Find the low-latency path (lowest RTT) dynamically
+            if let Some(low_latency_stats) = conn.path_stats().min_by_key(|p| p.rtt) {
+                probing_metrics.update_cwnd(low_latency_stats.cwnd as u64, Instant::now());
+            }
+        }
+
         // Generate outgoing QUIC packets and send them on the UDP socket, until
         // quiche reports that there are no more packets to be sent.
         for (_,current_path) in conn.paths.iter(){
@@ -654,28 +829,90 @@ pub fn connect(
                 let socket = &sockets[token];
                 let is_ack = is_low_latency;
                 loop {
-                    let (write, send_info) = match conn.send_on_path_separate(
-                        &mut out,
-                        Some(local_addr),
-                        Some(peer_addr),
-                        &mut Some(is_ack)
-                    ) {
-                        Ok(v) => v,
+                    // Decide whether to use PING-enhanced sending
+                    let use_ping_enhanced = is_low_latency && 
+                        args.enable_early_path_probing &&
+                        early_phase_detector.as_mut().map_or(false, |detector| detector.needs_active_probing(&conn));
+                    
+                    // Use probing frequency to decide if this packet should get PING
+                    let should_add_ping = if use_ping_enhanced {
+                        let now = Instant::now();
+                        let min_ping_interval = Duration::from_millis(500); // Minimum 500ms between PINGs
+                        
+                        // Check rate limiting first
+                        if !probing_metrics.can_send_ping(now, min_ping_interval) {
+                            false
+                        } else {
+                            let freq = early_phase_detector.as_ref().map_or(0.0, |detector| detector.get_probing_frequency(&conn));
+                            // Simple probabilistic decision based on packet count
+                            (pkt_count % 100) as f64 / 100.0 < freq
+                        }
+                    } else {
+                        false
+                    };
+                    
+                    let (write, send_info) = if should_add_ping {
+                        // Record that we're sending a PING frame
+                        let now = Instant::now();
+                        probing_metrics.record_ping_sent(now);
+                        debug!("Adding PING frame to ACK packet for early path probing on {:?} -> {:?}", local_addr, peer_addr);
+                        
+                        // Use PING-enhanced sending
+                        match conn.send_on_path_with_ping(
+                            &mut out,
+                            Some(local_addr),
+                            Some(peer_addr)
+                        ) {
+                            Ok(v) => v,
+                            Err(quiche::Error::Done) => {
+                                // Fall back to regular separate sending if PING method fails
+                                match conn.send_on_path_separate(
+                                    &mut out,
+                                    Some(local_addr),
+                                    Some(peer_addr),
+                                    &mut Some(is_ack)
+                                ) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        trace!("{} -> {}: done writing", local_addr, peer_addr);
+                                        break;
+                                    }
+                                }
+                            },
+                            Err(e) => {
+                                error!(
+                                    "{} -> {}: send failed: {:?}",
+                                    local_addr, peer_addr, e
+                                );
+                                conn.close(false, 0x1, b"fail").ok();
+                                break;
+                            }
+                        }
+                    } else {
+                        // Use regular separate sending
+                        match conn.send_on_path_separate(
+                            &mut out,
+                            Some(local_addr),
+                            Some(peer_addr),
+                            &mut Some(is_ack)
+                        ) {
+                            Ok(v) => v,
 
-                        Err(quiche::Error::Done) => {
-                            trace!("{} -> {}: done writing", local_addr, peer_addr);
-                            break;
-                        },
+                            Err(quiche::Error::Done) => {
+                                trace!("{} -> {}: done writing", local_addr, peer_addr);
+                                break;
+                            },
 
-                        Err(e) => {
-                            error!(
-                                "{} -> {}: send failed: {:?}",
-                                local_addr, peer_addr, e
-                            );
+                            Err(e) => {
+                                error!(
+                                    "{} -> {}: send failed: {:?}",
+                                    local_addr, peer_addr, e
+                                );
 
-                            conn.close(false, 0x1, b"fail").ok();
-                            break;
-                        },
+                                conn.close(false, 0x1, b"fail").ok();
+                                break;
+                            },
+                        }
                     };
 
                     if let Err(e) = socket.send_to(&out[..write], send_info.to) {

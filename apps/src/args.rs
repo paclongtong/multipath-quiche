@@ -339,6 +339,9 @@ Options:
   --session-file PATH      File used to cache a TLS session for resumption.
   --source-port PORT       Source port to use when connecting to the server [default: 0].
   --disable-pacing         Disable pacing.
+  --enable-early-path-probing    Enable active probing for path 1 CWND ramp-up.
+  --probing-duration-ms MS       Duration of initial probing phase [default: 8000].
+  --cwnd-ratio-threshold RATIO   CWND ratio threshold for probing [default: 0.5].
   --initial-cwnd-packets PACKETS   The initial congestion window size in terms of packet count [default: 10].
   -h --help                Show this screen.
 ";
@@ -366,6 +369,9 @@ pub struct ClientArgs {
     pub status: Vec<(std::time::Duration, SocketAddr, bool)>,
     pub retire_dcids: Vec<(std::time::Duration, PathId, CIDSeq)>,
     pub disable_pacing: bool,
+    pub enable_early_path_probing: bool,
+    pub probing_duration_ms: u64,
+    pub cwnd_ratio_threshold: f64,
 }
 
 impl Args for ClientArgs {
@@ -451,6 +457,14 @@ impl Args for ClientArgs {
         let send_priority_update = args.get_bool("--send-priority-update");
 
         let disable_pacing = args.get_bool("--disable-pacing");
+
+        let enable_early_path_probing = args.get_bool("--enable-early-path-probing");
+
+        let probing_duration_ms = args.get_str("--probing-duration-ms");
+        let probing_duration_ms = probing_duration_ms.parse::<u64>().unwrap();
+
+        let cwnd_ratio_threshold = args.get_str("--cwnd-ratio-threshold");
+        let cwnd_ratio_threshold = cwnd_ratio_threshold.parse::<f64>().unwrap();
 
         let addrs = args
             .get_vec("--address")
@@ -549,6 +563,9 @@ impl Args for ClientArgs {
             status,
             retire_dcids,
             disable_pacing,
+            enable_early_path_probing,
+            probing_duration_ms,
+            cwnd_ratio_threshold,
         }
     }
 }
@@ -577,6 +594,9 @@ impl Default for ClientArgs {
             status: vec![],
             retire_dcids: vec![],
             disable_pacing: false,
+            enable_early_path_probing: false,
+            probing_duration_ms: 4000,
+            cwnd_ratio_threshold: 0.5,
         }
     }
 }

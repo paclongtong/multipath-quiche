@@ -5396,6 +5396,29 @@ impl Connection {
         Ok((done, info))
     }
 
+    /// Send packet on path with forced PING frame for ACK eliciting
+    pub fn send_on_path_with_ping(
+        &mut self, out: &mut [u8], from: Option<SocketAddr>,
+        to: Option<SocketAddr>
+    ) -> Result<(usize, SendInfo)> {
+        // Find the path we're sending on
+        let send_pid = match (from, to) {
+            (Some(f), Some(t)) => self
+                .paths
+                .path_id_from_addrs(&(f, t))
+                .ok_or(Error::InvalidState)?,
+            _ => self.get_send_path_id(from, to)?,
+        };
+
+        // Force ACK-eliciting behavior by setting the flag
+        if let Ok(send_path) = self.paths.get_mut(send_pid) {
+            send_path.needs_ack_eliciting = true;
+        }
+
+        // Use the regular send method, which will now include PING frames
+        self.send_on_path(out, from, to)
+    }
+
     pub fn send_on_path_separate_server(
         &mut self, out: &mut [u8], from: Option<SocketAddr>,
         to: Option<SocketAddr>,
