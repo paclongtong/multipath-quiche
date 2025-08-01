@@ -63,6 +63,7 @@ pub enum ConnectivityEventType {
     ConnectionStateUpdated,
     MtuUpdated,
     CubicStateUpdate,
+    BbrStateUpdate,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -171,4 +172,29 @@ pub struct CubicStateUpdate {
     pub new_state: String,
     pub trigger: String,
     pub data: CubicStateUpdateData,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct BbrStateUpdateData {
+    pub cwnd: u64,
+    pub pacing_rate: u64,
+    pub btlbw: u64,
+    pub rtprop_us: u128,
+    pub pacing_gain: f64,
+    pub cwnd_gain: f64,
+    pub filled_pipe: bool,
+    pub round_count: u64,
+    pub cycle_index: Option<usize>,
+    pub bytes_in_flight: Option<u64>,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct BbrStateUpdate {
+    pub path_id: u64,
+    pub old_state: String,
+    pub new_state: String,
+    pub trigger: String,
+    pub data: BbrStateUpdateData,
 }

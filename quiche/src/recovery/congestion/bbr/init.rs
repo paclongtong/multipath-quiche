@@ -27,6 +27,7 @@
 use self::rtt::INITIAL_RTT;
 
 use super::*;
+use crate::QlogInfo;
 
 use std::time::Instant;
 
@@ -46,7 +47,7 @@ pub fn bbr_init(r: &mut Congestion) {
     bbr_init_round_counting(r);
     bbr_init_full_pipe(r);
     bbr_init_pacing_rate(r);
-    bbr_enter_startup(r);
+    bbr_enter_startup_initial(r);
 }
 
 // 4.1.1.3.  Tracking Time for the BBR.BtlBw Max Filter
@@ -70,8 +71,26 @@ fn bbr_init_pacing_rate(r: &mut Congestion) {
     bbr.pacing_rate = (bbr.pacing_gain * nominal_bandwidth) as u64;
 }
 
-// 4.3.2.1.  Startup Dynamics
-pub fn bbr_enter_startup(r: &mut Congestion) {
+// 4.3.2.1.  Startup Dynamics (with qlog)
+pub fn bbr_enter_startup(r: &mut Congestion, qlog: &mut QlogInfo) {
+    let old_state = r.bbr_state.state;
+    let bbr = &mut r.bbr_state;
+
+    bbr.state = BBRStateMachine::Startup;
+    bbr.pacing_gain = BBR_HIGH_GAIN;
+    bbr.cwnd_gain = BBR_HIGH_GAIN;
+
+    // qlog BBR state transition if old state is different
+    if old_state != BBRStateMachine::Startup {
+        super::qlog_bbr_state_transition(
+            r, old_state, BBRStateMachine::Startup, 
+            "enter_startup", Instant::now(), None, qlog
+        );
+    }
+}
+
+// 4.3.2.1.  Startup Dynamics (initial, no qlog)
+fn bbr_enter_startup_initial(r: &mut Congestion) {
     let bbr = &mut r.bbr_state;
 
     bbr.state = BBRStateMachine::Startup;

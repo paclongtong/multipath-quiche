@@ -37,9 +37,19 @@ use log::debug;
 use crate::minmax::Minmax;
 use crate::recovery::*;
 
+use qlog::events::EventData;
+#[cfg(feature = "qlog")]
+use qlog::events::EventType;
+#[cfg(feature = "qlog")]
+use qlog::events::EventImportance;
+
 use std::time::Duration;
 
 use super::CongestionControlOps;
+
+#[cfg(feature = "qlog")]
+const QLOG_BBR_STATE_UPDATED: EventType = 
+    EventType::ConnectivityEventType(qlog::events::connectivity::ConnectivityEventType::BbrStateUpdate);
 
 pub(crate) static BBR: CongestionControlOps = CongestionControlOps {
     on_init,
@@ -86,12 +96,57 @@ const PACING_GAIN_CYCLE: [f64; BBR_GAIN_CYCLE_LEN] =
 const BTLBW_GROWTH_TARGET: f64 = 1.25;
 
 /// BBR Internal State Machine.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 enum BBRStateMachine {
     Startup,
     Drain,
     ProbeBW,
     ProbeRTT,
+}
+
+impl std::fmt::Display for BBRStateMachine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+/// Helper function to log BBR state transitions with qlog
+fn qlog_bbr_state_transition(
+    r: &Congestion, old_state: BBRStateMachine, new_state: BBRStateMachine, 
+    trigger: &str, now: Instant, bytes_in_flight: Option<usize>, qlog: &mut QlogInfo
+) {
+    #[cfg(feature = "qlog")]
+    {
+        qlog_with_type!(QLOG_BBR_STATE_UPDATED, qlog, q, {
+            let ev_data = Some(
+                EventData::BbrStateUpdate(
+                    qlog::events::connectivity::BbrStateUpdate {
+                        path_id: r.path_id,
+                        old_state: old_state.to_string(),
+                        new_state: new_state.to_string(),
+                        trigger: trigger.to_string(),
+                        data: qlog::events::connectivity::BbrStateUpdateData {
+                            cwnd: r.congestion_window as u64,
+                            pacing_rate: r.bbr_state.pacing_rate,
+                            btlbw: r.bbr_state.btlbw,
+                            rtprop_us: r.bbr_state.rtprop.as_micros(),
+                            pacing_gain: r.bbr_state.pacing_gain,
+                            cwnd_gain: r.bbr_state.cwnd_gain,
+                            filled_pipe: r.bbr_state.filled_pipe,
+                            round_count: r.bbr_state.round_count,
+                            cycle_index: if new_state == BBRStateMachine::ProbeBW { 
+                                Some(r.bbr_state.cycle_index) 
+                            } else { 
+                                None 
+                            },
+                            bytes_in_flight: bytes_in_flight.map(|b| b as u64),
+                        },
+                    }
+                )
+            );
+            q.add_event_data_with_instant(ev_data.unwrap(), now).ok();
+        });
+    }
 }
 
 /// BBR Specific State Variables.
@@ -306,7 +361,7 @@ fn on_packets_acked(
         packets.drain(..).fold(0, |acked_bytes, p| {
             r.bbr_state.prior_bytes_in_flight -= p.size;
 
-            per_ack::bbr_update_model_and_state(r, &p, bytes_in_flight, now);
+            per_ack::bbr_update_model_and_state(r, &p, bytes_in_flight, now, qlog);
 
             acked_bytes + p.size
         });

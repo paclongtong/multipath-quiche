@@ -27,6 +27,7 @@
 use super::*;
 use crate::rand;
 use crate::recovery;
+use crate::QlogInfo;
 
 /// 1.2Mbps in bytes/sec
 const PACING_RATE_1_2MBPS: u64 = 1200 * 1000 / 8;
@@ -43,14 +44,14 @@ fn bbr_min_pipe_cwnd(r: &mut Congestion) -> usize {
 // BBR Functions when ACK is received.
 //
 pub fn bbr_update_model_and_state(
-    r: &mut Congestion, packet: &Acked, bytes_in_flight: usize, now: Instant,
+    r: &mut Congestion, packet: &Acked, bytes_in_flight: usize, now: Instant, qlog: &mut QlogInfo,
 ) {
     bbr_update_btlbw(r, packet, bytes_in_flight);
-    bbr_check_cycle_phase(r, now);
+    bbr_check_cycle_phase(r, now, qlog);
     bbr_check_full_pipe(r);
-    bbr_check_drain(r, bytes_in_flight, now);
+    bbr_check_drain(r, bytes_in_flight, now, qlog);
     bbr_update_rtprop(r, now);
-    bbr_check_probe_rtt(r, bytes_in_flight, now);
+    bbr_check_probe_rtt(r, bytes_in_flight, now, qlog);
 }
 
 pub fn bbr_update_control_parameters(
@@ -238,7 +239,8 @@ fn bbr_check_full_pipe(r: &mut Congestion) {
 }
 
 // 4.3.3.  Drain
-fn bbr_enter_drain(r: &mut Congestion) {
+fn bbr_enter_drain(r: &mut Congestion, qlog: &mut QlogInfo) {
+    let old_state = r.bbr_state.state;
     let bbr = &mut r.bbr_state;
 
     bbr.state = BBRStateMachine::Drain;
@@ -248,23 +250,30 @@ fn bbr_enter_drain(r: &mut Congestion) {
 
     // maintain cwnd
     bbr.cwnd_gain = BBR_HIGH_GAIN;
+
+    // qlog BBR state transition
+    super::qlog_bbr_state_transition(
+        r, old_state, BBRStateMachine::Drain, 
+        "pipe_filled", Instant::now(), None, qlog
+    );
 }
 
-fn bbr_check_drain(r: &mut Congestion, bytes_in_flight: usize, now: Instant) {
+fn bbr_check_drain(r: &mut Congestion, bytes_in_flight: usize, now: Instant, qlog: &mut QlogInfo) {
     if r.bbr_state.state == BBRStateMachine::Startup && r.bbr_state.filled_pipe {
-        bbr_enter_drain(r);
+        bbr_enter_drain(r, qlog);
     }
 
     if r.bbr_state.state == BBRStateMachine::Drain &&
         bytes_in_flight <= bbr_inflight(r, 1.0)
     {
         // we estimate queue is drained
-        bbr_enter_probe_bw(r, now);
+        bbr_enter_probe_bw(r, now, qlog);
     }
 }
 
 // 4.3.4.3.  Gain Cycling Algorithm
-fn bbr_enter_probe_bw(r: &mut Congestion, now: Instant) {
+fn bbr_enter_probe_bw(r: &mut Congestion, now: Instant, qlog: &mut QlogInfo) {
+    let old_state = r.bbr_state.state;
     let bbr = &mut r.bbr_state;
 
     bbr.state = BBRStateMachine::ProbeBW;
@@ -280,10 +289,16 @@ fn bbr_enter_probe_bw(r: &mut Congestion, now: Instant) {
         1 -
         (rand::rand_u64_uniform(BBR_GAIN_CYCLE_LEN as u64 - 1) as usize);
 
+    // qlog BBR state transition
+    super::qlog_bbr_state_transition(
+        r, old_state, BBRStateMachine::ProbeBW, 
+        "queue_drained", now, None, qlog
+    );
+
     bbr_advance_cycle_phase(r, now);
 }
 
-fn bbr_check_cycle_phase(r: &mut Congestion, now: Instant) {
+fn bbr_check_cycle_phase(r: &mut Congestion, now: Instant, _qlog: &mut QlogInfo) {
     let bbr = &mut r.bbr_state;
 
     if bbr.state == BBRStateMachine::ProbeBW && bbr_is_next_cycle_phase(r, now) {
@@ -322,34 +337,41 @@ fn bbr_is_next_cycle_phase(r: &mut Congestion, now: Instant) -> bool {
 }
 
 // 4.3.5.  ProbeRTT
-fn bbr_check_probe_rtt(r: &mut Congestion, bytes_in_flight: usize, now: Instant) {
+fn bbr_check_probe_rtt(r: &mut Congestion, bytes_in_flight: usize, now: Instant, qlog: &mut QlogInfo) {
     if r.bbr_state.state != BBRStateMachine::ProbeRTT &&
         r.bbr_state.rtprop_expired &&
         !r.bbr_state.idle_restart
     {
-        bbr_enter_probe_rtt(r);
+        bbr_enter_probe_rtt(r, qlog);
 
         r.bbr_state.prior_cwnd = bbr_save_cwnd(r);
         r.bbr_state.probe_rtt_done_stamp = None;
     }
 
     if r.bbr_state.state == BBRStateMachine::ProbeRTT {
-        bbr_handle_probe_rtt(r, bytes_in_flight, now);
+        bbr_handle_probe_rtt(r, bytes_in_flight, now, qlog);
     }
 
     r.bbr_state.idle_restart = false;
 }
 
-fn bbr_enter_probe_rtt(r: &mut Congestion) {
+fn bbr_enter_probe_rtt(r: &mut Congestion, qlog: &mut QlogInfo) {
+    let old_state = r.bbr_state.state;
     let bbr = &mut r.bbr_state;
 
     bbr.state = BBRStateMachine::ProbeRTT;
     bbr.pacing_gain = 1.0;
     bbr.cwnd_gain = 1.0;
+
+    // qlog BBR state transition
+    super::qlog_bbr_state_transition(
+        r, old_state, BBRStateMachine::ProbeRTT, 
+        "rtprop_expired", Instant::now(), None, qlog
+    );
 }
 
 fn bbr_handle_probe_rtt(
-    r: &mut Congestion, bytes_in_flight: usize, now: Instant,
+    r: &mut Congestion, bytes_in_flight: usize, now: Instant, qlog: &mut QlogInfo,
 ) {
     // Ignore low rate samples during ProbeRTT.
     r.delivery_rate.update_app_limited(true);
@@ -363,7 +385,7 @@ fn bbr_handle_probe_rtt(
             r.bbr_state.rtprop_stamp = now;
 
             bbr_restore_cwnd(r);
-            bbr_exit_probe_rtt(r, now);
+            bbr_exit_probe_rtt(r, now, qlog);
         }
     } else if bytes_in_flight <= bbr_min_pipe_cwnd(r) {
         r.bbr_state.probe_rtt_done_stamp = Some(now + PROBE_RTT_DURATION);
@@ -372,10 +394,10 @@ fn bbr_handle_probe_rtt(
     }
 }
 
-fn bbr_exit_probe_rtt(r: &mut Congestion, now: Instant) {
+fn bbr_exit_probe_rtt(r: &mut Congestion, now: Instant, qlog: &mut QlogInfo) {
     if r.bbr_state.filled_pipe {
-        bbr_enter_probe_bw(r, now);
+        bbr_enter_probe_bw(r, now, qlog);
     } else {
-        init::bbr_enter_startup(r);
+        init::bbr_enter_startup(r, qlog);
     }
 }

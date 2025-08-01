@@ -220,6 +220,9 @@ impl From<EventType> for EventImportance {
             EventType::ConnectivityEventType(
                 ConnectivityEventType::CubicStateUpdate,
             ) => EventImportance::Core,
+            EventType::ConnectivityEventType(
+                ConnectivityEventType::BbrStateUpdate,
+            ) => EventImportance::Core,
 
             EventType::SecurityEventType(SecurityEventType::KeyUpdated) =>
                 EventImportance::Base,
@@ -402,6 +405,9 @@ impl From<&EventData> for EventType {
             EventData::CubicStateUpdate { .. } => EventType::ConnectivityEventType(
                 ConnectivityEventType::CubicStateUpdate,
             ),
+            EventData::BbrStateUpdate { .. } => EventType::ConnectivityEventType(
+                ConnectivityEventType::BbrStateUpdate,
+            ),
 
             EventData::KeyUpdated { .. } =>
                 EventType::SecurityEventType(SecurityEventType::KeyUpdated),
@@ -555,6 +561,9 @@ pub enum EventData {
 
     #[serde(rename = "connectivity:cubic_state_update")]
     CubicStateUpdate(connectivity::CubicStateUpdate),
+
+    #[serde(rename = "connectivity:bbr_state_update")]
+    BbrStateUpdate(connectivity::BbrStateUpdate),
 
     // Security
     #[serde(rename = "security:key_updated")]
