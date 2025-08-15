@@ -1729,6 +1729,7 @@ pub struct Connection {
     pub ack_threshold: usize,
     pub metrics: Metrics,
     pub ack_frequency: u64,
+    pub received_data_packet_count: u64,
 }
 
 /// Creates a new server-side connection.
@@ -2174,8 +2175,9 @@ impl Connection {
 
             path_id_to_abandon: VecDeque::new(),
             global_ack_pending: false,
-            ack_frequency: 10,
+            ack_frequency: 2,
             ack_threshold: 1,
+            received_data_packet_count: 0,
             metrics: Metrics::new(),
         };
 
@@ -3399,6 +3401,12 @@ impl Connection {
         pkt_num_space.recv_pkt_num.insert(pn);
 
         pkt_num_space.recv_pkt_need_ack.push_item(pn);
+        
+        // Increment data packet counter for ACK frequency control
+        if self.ack_frequency > 1 {
+            self.received_data_packet_count += 1;
+            // Note: counter will be reset when ACK is actually sent
+        }
 
         pkt_num_space.ack_elicited =
             cmp::max(pkt_num_space.ack_elicited, ack_elicited);
@@ -4143,6 +4151,7 @@ impl Connection {
         // ACK eliciting.
         if !multiple_application_data_pkt_num_spaces &&
             pkt_space.recv_pkt_need_ack.len() > 0 &&
+            (epoch != packet::Epoch::Application || self.ack_frequency <= 1 || self.received_data_packet_count >= self.ack_frequency) &&
             (pkt_space.ack_elicited || ack_elicit_required) &&
             (!is_closing ||
                 (pkt_type == Type::Handshake &&
@@ -4173,6 +4182,10 @@ impl Connection {
                 // available cwnd.
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     pkt_space.ack_elicited = false;
+                    // Reset ACK frequency counter when ACK is actually sent
+                    if self.ack_frequency > 1 && self.received_data_packet_count >= self.ack_frequency {
+                        self.received_data_packet_count = 0;
+                    }
                 }
             }
         }
@@ -4188,6 +4201,7 @@ impl Connection {
             let mut wrote_ack_mp = false;
             let pns = self.pkt_num_spaces.spaces.get_mut(epoch, path_id)?;
             if pns.recv_pkt_need_ack.len() > 0 && 
+                (epoch != packet::Epoch::Application || self.ack_frequency <= 1 || self.received_data_packet_count >= self.ack_frequency) &&
                 (pns.ack_elicited || ack_elicit_required)
             {
                 let ack_delay = pns.largest_rx_pkt_time.elapsed();
@@ -4235,6 +4249,7 @@ impl Connection {
                     let pns =
                         self.pkt_num_spaces.spaces.get_mut(epoch, space_id)?;
                     if pns.recv_pkt_need_ack.len() > 0 &&
+                        (epoch != packet::Epoch::Application || self.ack_frequency <= 1 || self.received_data_packet_count >= self.ack_frequency) &&
                         (pns.ack_elicited || ack_elicit_required)
                     {
                         let ack_delay = pns.largest_rx_pkt_time.elapsed();
@@ -5933,6 +5948,7 @@ impl Connection {
         // ACK eliciting.
         if !multiple_application_data_pkt_num_spaces &&
             pkt_space.recv_pkt_need_ack.len() > 0 &&
+            (epoch != packet::Epoch::Application || self.ack_frequency <= 1 || self.received_data_packet_count >= self.ack_frequency) &&
             (pkt_space.ack_elicited || ack_elicit_required) &&
             (!is_closing ||
                 (pkt_type == Type::Handshake &&
@@ -5963,6 +5979,10 @@ impl Connection {
                 // available cwnd.
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     pkt_space.ack_elicited = false;
+                    // Reset ACK frequency counter when ACK is actually sent
+                    if self.ack_frequency > 1 && self.received_data_packet_count >= self.ack_frequency {
+                        self.received_data_packet_count = 0;
+                    }
                 }
             }
         }
@@ -5980,6 +6000,7 @@ impl Connection {
                     // let mut wrote_ack_mp = false;
                     let pns = self.pkt_num_spaces.spaces.get_mut(epoch, current_space_id)?;
                     if pns.recv_pkt_need_ack.len() > 0 && 
+                        (epoch != packet::Epoch::Application || self.ack_frequency <= 1 || self.received_data_packet_count >= self.ack_frequency) &&
                         (pns.ack_elicited || ack_elicit_required)
                     {
                         let ack_delay = pns.largest_rx_pkt_time.elapsed();
@@ -6010,6 +6031,10 @@ impl Connection {
                         if left >= frame.wire_len() && (approx_current_payload_len + frame.wire_len() <= cwnd_available) {
                             if push_frame_to_pkt!(b, frames, frame, left) {
                                 pns.ack_elicited = false;
+                                // Reset ACK frequency counter when ACK is actually sent
+                                if self.ack_frequency > 1 && self.received_data_packet_count >= self.ack_frequency {
+                                    self.received_data_packet_count = 0;
+                                }
                             }
                         } else {
                             continue;
@@ -7396,6 +7421,7 @@ impl Connection {
         // ACK eliciting.
         if !multiple_application_data_pkt_num_spaces &&
             pkt_space.recv_pkt_need_ack.len() > 0 &&
+            (epoch != packet::Epoch::Application || self.ack_frequency <= 1 || self.received_data_packet_count >= self.ack_frequency) &&
             (pkt_space.ack_elicited || ack_elicit_required) &&
             (!is_closing ||
                 (pkt_type == Type::Handshake &&
@@ -7426,6 +7452,10 @@ impl Connection {
                 // available cwnd.
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     pkt_space.ack_elicited = false;
+                    // Reset ACK frequency counter when ACK is actually sent
+                    if self.ack_frequency > 1 && self.received_data_packet_count >= self.ack_frequency {
+                        self.received_data_packet_count = 0;
+                    }
                 }
             }
         }
@@ -7441,6 +7471,7 @@ impl Connection {
             let mut wrote_ack_mp = false;
             let pns = self.pkt_num_spaces.spaces.get_mut(epoch, path_id)?;
             if pns.recv_pkt_need_ack.len() > 0 && 
+                (epoch != packet::Epoch::Application || self.ack_frequency <= 1 || self.received_data_packet_count >= self.ack_frequency) &&
                 (pns.ack_elicited || ack_elicit_required) && *ack_mode
             {
                 let ack_delay = pns.largest_rx_pkt_time.elapsed();
@@ -7488,6 +7519,7 @@ impl Connection {
                     let pns =
                         self.pkt_num_spaces.spaces.get_mut(epoch, space_id)?;
                     if pns.recv_pkt_need_ack.len() > 0 &&
+                        (epoch != packet::Epoch::Application || self.ack_frequency <= 1 || self.received_data_packet_count >= self.ack_frequency) &&
                         (pns.ack_elicited || ack_elicit_required)
                     {
                         let ack_delay = pns.largest_rx_pkt_time.elapsed();
@@ -9340,6 +9372,52 @@ impl Connection {
             .ok_or(Error::InvalidState)?;
         self.paths.get_mut(path_id)?.needs_ack_eliciting = true;
         Ok(())
+    }
+
+    /// Sets the ACK frequency for this connection.
+    ///
+    /// The ACK frequency determines how often ACKs are sent in response to 
+    /// received application data packets during the Application epoch. 
+    /// Handshake ACKs (Initial/Handshake epochs) are never throttled.
+    /// A frequency of 1 means ACK every packet (default),
+    /// a frequency of 10 means ACK every 10th packet, etc.
+    ///
+    /// Setting frequency to 0 disables frequency control and falls back to
+    /// the default ACK behavior.
+    pub fn set_ack_frequency(&mut self, frequency: u64) {
+        self.ack_frequency = frequency;
+        // Reset counter when frequency changes
+        self.received_data_packet_count = 0;
+    }
+
+    /// Gets the current ACK frequency setting.
+    pub fn ack_frequency(&self) -> u64 {
+        self.ack_frequency
+    }
+
+    /// Checks if we should send an ACK based on frequency control.
+    /// Returns true if ACK should be sent according to frequency settings.
+    /// Only applies to Application epoch packets - handshake ACKs are never throttled.
+    fn should_send_ack_by_frequency(&self) -> bool {
+        // If frequency is 0 or 1, always allow ACK (backward compatibility)
+        if self.ack_frequency <= 1 {
+            return true;
+        }
+        
+        // Check if we've received enough data packets to warrant an ACK
+        self.received_data_packet_count >= self.ack_frequency
+    }
+
+    /// Increments the received data packet counter and resets if threshold is reached.
+    /// Only applies during Application epoch - handshake packets don't affect counter.
+    fn on_data_packet_received(&mut self) {
+        if self.ack_frequency > 1 {
+            self.received_data_packet_count += 1;
+            if self.received_data_packet_count >= self.ack_frequency {
+                // Reset counter when threshold is reached, allowing ACK to be sent
+                self.received_data_packet_count = 0;
+            }
+        }
     }
 
     /// Reads the first received DATAGRAM.
