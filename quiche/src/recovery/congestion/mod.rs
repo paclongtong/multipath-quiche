@@ -44,7 +44,7 @@ pub struct Congestion {
     // Congestion control.
     pub(crate) cc_ops: &'static CongestionControlOps,
 
-    cubic_state: cubic::State,
+    pub cubic_state: cubic::State,
 
     // HyStart++.
     pub(crate) hystart: hystart::Hystart,
@@ -60,10 +60,10 @@ pub struct Congestion {
     send_quantum: usize,
 
     // BBR state.
-    bbr_state: bbr::State,
+    pub bbr_state: bbr::State,
 
     // BBRv2 state.
-    bbr2_state: bbr2::State,
+    pub bbr2_state: bbr2::State,
 
     pub(crate) congestion_window: usize,
 
@@ -348,9 +348,9 @@ impl From<CongestionControlAlgorithm> for &'static CongestionControlOps {
     }
 }
 
-mod bbr;
-mod bbr2;
-mod cubic;
+pub mod bbr;
+pub mod bbr2;
+pub mod cubic;
 mod delivery_rate;
 mod hystart;
 pub(crate) mod pacer;

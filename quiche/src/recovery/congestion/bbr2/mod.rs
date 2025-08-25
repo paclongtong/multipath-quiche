@@ -136,7 +136,7 @@ const MAX_BW_COUNT: usize = 3;
 
 /// BBR2 Internal State Machine.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
-enum BBR2StateMachine {
+pub enum BBR2StateMachine {
     Startup,
     Drain,
     ProbeBWDOWN,
@@ -204,7 +204,7 @@ pub struct State {
 
     // 2.7.  General Algorithm State
     // The current state of a BBR2 flow in the BBR2 state machine.
-    state: BBR2StateMachine,
+    pub state: BBR2StateMachine,
 
     // Count of packet-timed round trips elapsed so far.
     round_count: u64,

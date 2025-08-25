@@ -122,7 +122,7 @@ pub struct State {
     // CUBIC state checkpoint preceding the last congestion event.
     prior: PriorState,
 
-    state: CubicState,
+    pub state: CubicState,
 }
 
 /// Stores the CUBIC state from before the last congestion event.

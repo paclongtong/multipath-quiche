@@ -97,7 +97,7 @@ const BTLBW_GROWTH_TARGET: f64 = 1.25;
 
 /// BBR Internal State Machine.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
-enum BBRStateMachine {
+pub enum BBRStateMachine {
     Startup,
     Drain,
     ProbeBW,
@@ -152,7 +152,7 @@ fn qlog_bbr_state_transition(
 /// BBR Specific State Variables.
 pub struct State {
     // The current state of a BBR flow in the BBR state machine.
-    state: BBRStateMachine,
+    pub state: BBRStateMachine,
 
     // The current pacing rate for a BBR flow, which controls inter-packet
     // spacing.

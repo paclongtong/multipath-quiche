@@ -1730,6 +1730,19 @@ pub struct Connection {
     pub metrics: Metrics,
     pub ack_frequency: u64,
     pub received_data_packet_count: u64,
+
+    // Dynamic ACK Frequency Negotiation - Sender Side
+    ack_frequency_sequence_number: u64,
+    needs_ack_frequency_update: bool,
+    requested_ack_eliciting_threshold: u64,
+    requested_max_ack_delay: u64,
+
+    // Dynamic ACK Frequency Negotiation - Receiver Side  
+    ack_eliciting_threshold: u64,
+    max_ack_delay: std::time::Duration,
+    last_ack_frequency_sequence_number: u64,
+    ack_eliciting_packets_since_last_ack: u64,
+    ack_deadline: Option<std::time::Instant>,
 }
 
 /// Creates a new server-side connection.
@@ -2179,6 +2192,19 @@ impl Connection {
             ack_threshold: 1,
             received_data_packet_count: 0,
             metrics: Metrics::new(),
+
+            // Dynamic ACK Frequency Negotiation - Sender Side
+            ack_frequency_sequence_number: 1, // Start with 1 so first frame is processed
+            needs_ack_frequency_update: false,
+            requested_ack_eliciting_threshold: 2, // Initial sensible default
+            requested_max_ack_delay: 25000, // 25ms in microseconds
+
+            // Dynamic ACK Frequency Negotiation - Receiver Side
+            ack_eliciting_threshold: 2, // Start with standard QUIC default
+            max_ack_delay: std::time::Duration::from_millis(25), // Standard default
+            last_ack_frequency_sequence_number: 0,
+            ack_eliciting_packets_since_last_ack: 0,
+            ack_deadline: None,
         };
 
         // Don't support multipath with zero-length CIDs.
@@ -3402,10 +3428,27 @@ impl Connection {
 
         pkt_num_space.recv_pkt_need_ack.push_item(pn);
         
-        // Increment data packet counter for ACK frequency control
-        if self.ack_frequency > 1 {
-            self.received_data_packet_count += 1;
-            // Note: counter will be reset when ACK is actually sent
+        // Check for immediate ACK conditions based on packet characteristics
+        let needs_immediate_ack = Connection::check_packet_immediate_ack_conditions_static(&hdr, pn, pkt_num_space.largest_rx_pkt_num, epoch, &self.trace_id);
+        
+        // Update dynamic ACK frequency tracking for Application epoch
+        if epoch == packet::Epoch::Application && ack_elicited {
+            if needs_immediate_ack {
+                // Override: Force immediate ACK regardless of frequency settings
+                self.ack_deadline = Some(now);
+                self.ack_eliciting_packets_since_last_ack = self.ack_eliciting_threshold;
+            } else {
+                // Normal frequency-based tracking
+                self.ack_eliciting_packets_since_last_ack += 1;
+                
+                trace!("{} ACK_PACKET_COUNT: received ack-eliciting packet, count={}/{}, threshold={}", 
+                       self.trace_id, self.ack_eliciting_packets_since_last_ack, self.ack_eliciting_threshold, self.ack_eliciting_threshold);
+                
+                // Set ACK deadline if this is the first packet since last ACK
+                if self.ack_deadline.is_none() {
+                    self.ack_deadline = Some(now + self.max_ack_delay);
+                }
+            }
         }
 
         pkt_num_space.ack_elicited =
@@ -4151,7 +4194,7 @@ impl Connection {
         // ACK eliciting.
         if !multiple_application_data_pkt_num_spaces &&
             pkt_space.recv_pkt_need_ack.len() > 0 &&
-            (epoch != packet::Epoch::Application || self.ack_frequency <= 1 || self.received_data_packet_count >= self.ack_frequency) &&
+            Self::should_send_ack_dynamic(epoch, now, self.ack_eliciting_packets_since_last_ack, self.ack_eliciting_threshold, self.ack_deadline) &&
             (pkt_space.ack_elicited || ack_elicit_required) &&
             (!is_closing ||
                 (pkt_type == Type::Handshake &&
@@ -4182,10 +4225,10 @@ impl Connection {
                 // available cwnd.
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     pkt_space.ack_elicited = false;
-                    // Reset ACK frequency counter when ACK is actually sent
-                    if self.ack_frequency > 1 && self.received_data_packet_count >= self.ack_frequency {
-                        self.received_data_packet_count = 0;
-                    }
+                    // Reset dynamic ACK frequency tracking when ACK is actually sent
+                    trace!("ACK_SENT_DEBUG: {} sent ACK, resetting counters from {}", self.trace_id, self.ack_eliciting_packets_since_last_ack);
+                    self.ack_eliciting_packets_since_last_ack = 0;
+                    self.ack_deadline = None;
                 }
             }
         }
@@ -4201,7 +4244,7 @@ impl Connection {
             let mut wrote_ack_mp = false;
             let pns = self.pkt_num_spaces.spaces.get_mut(epoch, path_id)?;
             if pns.recv_pkt_need_ack.len() > 0 && 
-                (epoch != packet::Epoch::Application || self.ack_frequency <= 1 || self.received_data_packet_count >= self.ack_frequency) &&
+                Self::should_send_ack_dynamic(epoch, now, self.ack_eliciting_packets_since_last_ack, self.ack_eliciting_threshold, self.ack_deadline) &&
                 (pns.ack_elicited || ack_elicit_required)
             {
                 let ack_delay = pns.largest_rx_pkt_time.elapsed();
@@ -4249,7 +4292,7 @@ impl Connection {
                     let pns =
                         self.pkt_num_spaces.spaces.get_mut(epoch, space_id)?;
                     if pns.recv_pkt_need_ack.len() > 0 &&
-                        (epoch != packet::Epoch::Application || self.ack_frequency <= 1 || self.received_data_packet_count >= self.ack_frequency) &&
+                        Self::should_send_ack_dynamic(epoch, now, self.ack_eliciting_packets_since_last_ack, self.ack_eliciting_threshold, self.ack_deadline) &&
                         (pns.ack_elicited || ack_elicit_required)
                     {
                         let ack_delay = pns.largest_rx_pkt_time.elapsed();
@@ -4447,6 +4490,40 @@ impl Connection {
 
                     ack_eliciting = true;
                     in_flight = true;
+                }
+            }
+
+            // Create ACK_FREQUENCY frame when needed.
+            if self.needs_ack_frequency_update && 
+               pkt_type == packet::Type::Short && 
+               !is_closing
+            {
+                let frame = frame::Frame::AckFrequency {
+                    sequence_number: self.ack_frequency_sequence_number,
+                    ack_eliciting_threshold: self.requested_ack_eliciting_threshold,
+                    max_ack_delay: self.requested_max_ack_delay,
+                    reordering_threshold: None, // Can be extended later if needed
+                };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.needs_ack_frequency_update = false;
+                    self.ack_frequency_sequence_number += 1;
+                    
+                    ack_eliciting = true;
+                    in_flight = true;
+                }
+            }
+
+            // Create IMMEDIATE_ACK frame for strategic RTT measurements.
+            if pkt_type == packet::Type::Short && !is_closing {
+                let should_request_immediate_ack = Connection::should_request_immediate_ack_static(&frames);
+                if should_request_immediate_ack {
+                    let frame = frame::Frame::ImmediateAck;
+                    
+                    if push_frame_to_pkt!(b, frames, frame, left) {
+                        ack_eliciting = true;
+                        in_flight = true;
+                    }
                 }
             }
 
@@ -5257,6 +5334,13 @@ impl Connection {
                 .pmtud_update_max_datagram_size(active_path.pmtud.get_current());
         }
 
+        // Check if network conditions warrant ACK frequency updates
+        // For the main send path, we assume data packets (not ACKs) to monitor congestion
+        if written > 0 {
+            trace!("{} send_single: written={}, send_pid={}", self.trace_id, written, send_pid);
+            self.check_ack_frequency_triggers_on_data_path(send_pid);
+        }
+
         Ok((pkt_type, written))
     }
 
@@ -5948,7 +6032,7 @@ impl Connection {
         // ACK eliciting.
         if !multiple_application_data_pkt_num_spaces &&
             pkt_space.recv_pkt_need_ack.len() > 0 &&
-            (epoch != packet::Epoch::Application || self.ack_frequency <= 1 || self.received_data_packet_count >= self.ack_frequency) &&
+            Self::should_send_ack_dynamic(epoch, now, self.ack_eliciting_packets_since_last_ack, self.ack_eliciting_threshold, self.ack_deadline) &&
             (pkt_space.ack_elicited || ack_elicit_required) &&
             (!is_closing ||
                 (pkt_type == Type::Handshake &&
@@ -5979,10 +6063,10 @@ impl Connection {
                 // available cwnd.
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     pkt_space.ack_elicited = false;
-                    // Reset ACK frequency counter when ACK is actually sent
-                    if self.ack_frequency > 1 && self.received_data_packet_count >= self.ack_frequency {
-                        self.received_data_packet_count = 0;
-                    }
+                    // Reset dynamic ACK frequency tracking when ACK is actually sent
+                    trace!("ACK_SENT_DEBUG: {} sent ACK, resetting counters from {}", self.trace_id, self.ack_eliciting_packets_since_last_ack);
+                    self.ack_eliciting_packets_since_last_ack = 0;
+                    self.ack_deadline = None;
                 }
             }
         }
@@ -6000,7 +6084,7 @@ impl Connection {
                     // let mut wrote_ack_mp = false;
                     let pns = self.pkt_num_spaces.spaces.get_mut(epoch, current_space_id)?;
                     if pns.recv_pkt_need_ack.len() > 0 && 
-                        (epoch != packet::Epoch::Application || self.ack_frequency <= 1 || self.received_data_packet_count >= self.ack_frequency) &&
+                        Self::should_send_ack_dynamic(epoch, now, self.ack_eliciting_packets_since_last_ack, self.ack_eliciting_threshold, self.ack_deadline) &&
                         (pns.ack_elicited || ack_elicit_required)
                     {
                         let ack_delay = pns.largest_rx_pkt_time.elapsed();
@@ -6035,6 +6119,10 @@ impl Connection {
                                 if self.ack_frequency > 1 && self.received_data_packet_count >= self.ack_frequency {
                                     self.received_data_packet_count = 0;
                                 }
+
+                                trace!("ACK_SENT_DEBUG: {} sent ACK, resetting counters from {}", self.trace_id, self.ack_eliciting_packets_since_last_ack);
+                                self.ack_eliciting_packets_since_last_ack = 0;
+                                self.ack_deadline = None;
                             }
                         } else {
                             continue;
@@ -6263,6 +6351,40 @@ impl Connection {
 
                     ack_eliciting = true;
                     in_flight = true;
+                }
+            }
+
+            // Create ACK_FREQUENCY frame when needed.
+            if self.needs_ack_frequency_update && 
+               pkt_type == packet::Type::Short && 
+               !is_closing
+            {
+                let frame = frame::Frame::AckFrequency {
+                    sequence_number: self.ack_frequency_sequence_number,
+                    ack_eliciting_threshold: self.requested_ack_eliciting_threshold,
+                    max_ack_delay: self.requested_max_ack_delay,
+                    reordering_threshold: None, // Can be extended later if needed
+                };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.needs_ack_frequency_update = false;
+                    self.ack_frequency_sequence_number += 1;
+                    
+                    ack_eliciting = true;
+                    in_flight = true;
+                }
+            }
+
+            // Create IMMEDIATE_ACK frame for strategic RTT measurements.
+            if pkt_type == packet::Type::Short && !is_closing {
+                let should_request_immediate_ack = Connection::should_request_immediate_ack_static(&frames);
+                if should_request_immediate_ack {
+                    let frame = frame::Frame::ImmediateAck;
+                    
+                    if push_frame_to_pkt!(b, frames, frame, left) {
+                        ack_eliciting = true;
+                        in_flight = true;
+                    }
                 }
             }
 
@@ -7076,6 +7198,15 @@ impl Connection {
                 .pmtud_update_max_datagram_size(active_path.pmtud.get_current());
         }
 
+        // Check if network conditions warrant ACK frequency updates
+        // Only check on the data path (is_ack = false) to monitor data path congestion
+        let is_data_path = is_ack.map_or(false, |ack| !ack);
+        trace!("{} send_single_packet: written={}, is_ack={:?}, is_data_path={}, send_pid={}", 
+               self.trace_id, written, is_ack, is_data_path, send_pid);
+        if written > 0 && is_data_path {
+            self.check_ack_frequency_triggers_on_data_path(send_pid);
+        }
+
         Ok((pkt_type, written))
     }
 
@@ -7421,7 +7552,7 @@ impl Connection {
         // ACK eliciting.
         if !multiple_application_data_pkt_num_spaces &&
             pkt_space.recv_pkt_need_ack.len() > 0 &&
-            (epoch != packet::Epoch::Application || self.ack_frequency <= 1 || self.received_data_packet_count >= self.ack_frequency) &&
+            Self::should_send_ack_dynamic(epoch, now, self.ack_eliciting_packets_since_last_ack, self.ack_eliciting_threshold, self.ack_deadline) &&
             (pkt_space.ack_elicited || ack_elicit_required) &&
             (!is_closing ||
                 (pkt_type == Type::Handshake &&
@@ -7452,10 +7583,9 @@ impl Connection {
                 // available cwnd.
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     pkt_space.ack_elicited = false;
-                    // Reset ACK frequency counter when ACK is actually sent
-                    if self.ack_frequency > 1 && self.received_data_packet_count >= self.ack_frequency {
-                        self.received_data_packet_count = 0;
-                    }
+                    trace!("ACK_SENT_DEBUG: {} sent ACK, resetting counters from {}", self.trace_id, self.ack_eliciting_packets_since_last_ack);
+                    self.ack_eliciting_packets_since_last_ack = 0;
+                    self.ack_deadline = None;
                 }
             }
         }
@@ -7471,7 +7601,7 @@ impl Connection {
             let mut wrote_ack_mp = false;
             let pns = self.pkt_num_spaces.spaces.get_mut(epoch, path_id)?;
             if pns.recv_pkt_need_ack.len() > 0 && 
-                (epoch != packet::Epoch::Application || self.ack_frequency <= 1 || self.received_data_packet_count >= self.ack_frequency) &&
+                Self::should_send_ack_dynamic(epoch, now, self.ack_eliciting_packets_since_last_ack, self.ack_eliciting_threshold, self.ack_deadline) &&
                 (pns.ack_elicited || ack_elicit_required) && *ack_mode
             {
                 let ack_delay = pns.largest_rx_pkt_time.elapsed();
@@ -7519,7 +7649,7 @@ impl Connection {
                     let pns =
                         self.pkt_num_spaces.spaces.get_mut(epoch, space_id)?;
                     if pns.recv_pkt_need_ack.len() > 0 &&
-                        (epoch != packet::Epoch::Application || self.ack_frequency <= 1 || self.received_data_packet_count >= self.ack_frequency) &&
+                        Self::should_send_ack_dynamic(epoch, now, self.ack_eliciting_packets_since_last_ack, self.ack_eliciting_threshold, self.ack_deadline) &&
                         (pns.ack_elicited || ack_elicit_required)
                     {
                         let ack_delay = pns.largest_rx_pkt_time.elapsed();
@@ -7721,6 +7851,40 @@ impl Connection {
 
                     ack_eliciting = true;
                     in_flight = true;
+                }
+            }
+
+            // Create ACK_FREQUENCY frame when needed.
+            if self.needs_ack_frequency_update && 
+               pkt_type == packet::Type::Short && 
+               !is_closing
+            {
+                let frame = frame::Frame::AckFrequency {
+                    sequence_number: self.ack_frequency_sequence_number,
+                    ack_eliciting_threshold: self.requested_ack_eliciting_threshold,
+                    max_ack_delay: self.requested_max_ack_delay,
+                    reordering_threshold: None, // Can be extended later if needed
+                };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.needs_ack_frequency_update = false;
+                    self.ack_frequency_sequence_number += 1;
+                    
+                    ack_eliciting = true;
+                    in_flight = true;
+                }
+            }
+
+            // Create IMMEDIATE_ACK frame for strategic RTT measurements.
+            if pkt_type == packet::Type::Short && !is_closing {
+                let should_request_immediate_ack = Connection::should_request_immediate_ack_static(&frames);
+                if should_request_immediate_ack {
+                    let frame = frame::Frame::ImmediateAck;
+                    
+                    if push_frame_to_pkt!(b, frames, frame, left) {
+                        ack_eliciting = true;
+                        in_flight = true;
+                    }
                 }
             }
 
@@ -8531,6 +8695,15 @@ impl Connection {
             active_path
                 .recovery
                 .pmtud_update_max_datagram_size(active_path.pmtud.get_current());
+        }
+
+        // Check if network conditions warrant ACK frequency updates
+        // Only check on the data path (is_ack = false) to monitor data path congestion
+        let is_data_path = is_ack.map_or(false, |ack| !ack);
+        trace!("{} send_single_packet: written={}, is_ack={:?}, is_data_path={}, send_pid={}", 
+               self.trace_id, written, is_ack, is_data_path, send_pid);
+        if written > 0 && is_data_path {
+            self.check_ack_frequency_triggers_on_data_path(send_pid);
         }
 
         Ok((pkt_type, written))
@@ -9418,6 +9591,310 @@ impl Connection {
                 self.received_data_packet_count = 0;
             }
         }
+    }
+
+    // =================================================================
+    // Dynamic ACK Frequency Negotiation Methods
+    // =================================================================
+
+    /// Triggers a request for more frequent ACKs due to congestion.
+    /// This will send an ACK_FREQUENCY frame on the next packet sent on the ACK path.
+    pub fn request_frequent_acks(&mut self) {
+        self.requested_ack_eliciting_threshold = 2;
+        self.requested_max_ack_delay = if let Ok(path) = self.paths.get_active_mut() {
+            // Use minimum RTT of ACK path (path1) if available, otherwise use a conservative 5ms
+            path.recovery.min_rtt().unwrap_or(std::time::Duration::from_millis(5)).as_micros().max(5000) as u64
+        } else {
+            5000 // 5ms fallback
+        };
+        self.needs_ack_frequency_update = true;
+    }
+
+    /// Requests relaxed ACK frequency during stable transfer.
+    /// This reduces ACK overhead when the network is stable.
+    pub fn request_relaxed_acks(&mut self) {
+        self.requested_ack_eliciting_threshold = 10;
+        self.requested_max_ack_delay = 25000; // 25ms
+        self.needs_ack_frequency_update = true;
+    }
+
+    /// Sets a custom ACK frequency request.
+    /// The sender will request the receiver to use these settings.
+    pub fn request_ack_frequency(&mut self, threshold: u64, max_delay_us: u64) {
+        self.requested_ack_eliciting_threshold = threshold;
+        self.requested_max_ack_delay = max_delay_us;
+        self.needs_ack_frequency_update = true;
+    }
+
+    /// Sends an IMMEDIATE_ACK request to force immediate ACK from receiver.
+    /// This is useful when the sender suspects packet loss and needs immediate feedback.
+    pub fn request_immediate_ack(&mut self) {
+        // This will be handled in the send logic to immediately create an IMMEDIATE_ACK frame
+        // For now, we'll trigger it by setting a flag we can check during packet generation
+        self.needs_ack_frequency_update = true;
+        // Note: We'll add a separate flag for immediate ACK later if needed
+    }
+
+    /// Check if sender conditions warrant an ACK frequency update based on data path congestion state.
+    /// This should be called during data transmission on the data path to monitor congestion.
+    fn check_ack_frequency_triggers_on_data_path(&mut self, data_path_id: usize) {
+        trace!("{} check_ack_frequency_triggers_on_data_path called for path {}", self.trace_id, data_path_id);
+        
+        // Always send initial ACK_FREQUENCY frame to establish dynamic frequency
+        if self.ack_frequency_sequence_number == 1 && self.handshake_completed {
+            trace!("{} sending initial ACK_FREQUENCY frame", self.trace_id);
+            self.requested_ack_eliciting_threshold = 2;  // Start with standard default
+            self.requested_max_ack_delay = 25000;  // 25ms default
+            self.needs_ack_frequency_update = true;
+            return;
+        }
+
+        // Check congestion state of the data path to determine ACK frequency needs
+        if let Ok(data_path) = self.paths.get(data_path_id) {
+            let congestion = &data_path.recovery.congestion;
+            
+            // Determine congestion state based on the active congestion control algorithm
+            let (in_slow_start, in_recovery, algorithm_specific_need_frequent_acks) = 
+                self.analyze_congestion_state(congestion, std::time::Instant::now());
+            
+            trace!("{} path {} congestion analysis: slow_start={}, recovery={}, algo_specific={}, cubic_state={:?}", 
+                   self.trace_id, data_path_id, in_slow_start, in_recovery, algorithm_specific_need_frequent_acks,
+                   congestion.cubic_state.state);
+            
+            let should_request_frequent_acks = in_recovery || algorithm_specific_need_frequent_acks;
+            let should_request_relaxed_acks = !should_request_frequent_acks;
+            
+            trace!("{} current threshold={}, should_request_frequent={}, should_request_relaxed={}", 
+                   self.trace_id, self.requested_ack_eliciting_threshold, should_request_frequent_acks, should_request_relaxed_acks);
+            
+            if should_request_frequent_acks && self.requested_ack_eliciting_threshold != 1 {
+                trace!("{} data path {} needs frequent ACKs (slow_start={}, recovery={}, algo_specific={})", 
+                       self.trace_id, data_path_id, in_slow_start, in_recovery, algorithm_specific_need_frequent_acks);
+                self.request_frequent_acks();
+            } else if should_request_relaxed_acks && self.requested_ack_eliciting_threshold != 10 {
+                trace!("{} data path {} can use relaxed ACKs", self.trace_id, data_path_id);
+                
+                // Use smoothed RTT of data path for max_ack_delay in relaxed mode
+                let smoothed_rtt_us = data_path.recovery.rtt().as_micros() as u64;
+                self.requested_ack_eliciting_threshold = 10;
+                self.requested_max_ack_delay = smoothed_rtt_us.max(25000); // At least 25ms
+                self.needs_ack_frequency_update = true;
+            } else {
+                trace!("{} no ACK frequency change needed (current={}, frequent_needed={}, relaxed_needed={})", 
+                       self.trace_id, self.requested_ack_eliciting_threshold, should_request_frequent_acks, should_request_relaxed_acks);
+            }
+        }
+    }
+
+    /// Analyze the congestion control state to determine if frequent ACKs are needed.
+    /// Returns (in_slow_start, in_recovery, algorithm_specific_need_frequent_acks)
+    fn analyze_congestion_state(&self, congestion: &crate::recovery::congestion::Congestion, now: std::time::Instant) -> (bool, bool, bool) {
+        use crate::recovery::congestion::cubic::CubicState;
+        
+        // Detect slow start based on CUBIC state
+        let in_slow_start = matches!(congestion.cubic_state.state, 
+            CubicState::SlowStart);
+        
+        let in_recovery = congestion.in_congestion_recovery(now);
+        
+        // Algorithm-specific state detection
+        let algorithm_specific_need_frequent_acks = self.check_algorithm_specific_states(congestion);
+        
+        (in_slow_start, in_recovery, algorithm_specific_need_frequent_acks)
+    }
+
+    /// Check algorithm-specific congestion states that need frequent ACKs
+    fn check_algorithm_specific_states(&self, congestion: &crate::recovery::congestion::Congestion) -> bool {
+        use crate::recovery::congestion::{cubic, bbr, bbr2};
+        
+        // Only check the states for the active congestion control algorithm
+        // This fixes the bug where inactive algorithms' default states always returned true
+        match congestion.cc_ops as *const _ {
+            ptr if ptr == &cubic::CUBIC as *const _ => self.check_cubic_states(congestion),
+            ptr if ptr == &bbr::BBR as *const _ => self.check_bbr_states(congestion),
+            ptr if ptr == &bbr2::BBR2 as *const _ => self.check_bbr2_states(congestion),
+            _ => false, // Reno or unknown algorithm, default to relaxed ACKs
+        }
+    }
+
+    /// Check CUBIC congestion control states that benefit from frequent ACKs
+    fn check_cubic_states(&self, congestion: &crate::recovery::congestion::Congestion) -> bool {
+        use crate::recovery::congestion::cubic::CubicState;
+        
+        match congestion.cubic_state.state {
+            // SlowStart and Conservative SlowStart both need frequent ACKs for fast feedback
+            CubicState::SlowStart => true,
+            
+            // Recovery state needs frequent ACKs to quickly detect further losses
+            CubicState::Recovery => true,
+            
+            // CongestionAvoidance can use relaxed ACKs for efficiency
+            CubicState::CongestionAvoidance | CubicState::ConservativeSlowStart => false,
+        }
+    }
+
+    /// Check BBR v1 congestion control states that benefit from frequent ACKs  
+    fn check_bbr_states(&self, congestion: &crate::recovery::congestion::Congestion) -> bool {
+        use crate::recovery::congestion::bbr::BBRStateMachine;
+        
+        match congestion.bbr_state.state {
+            // Startup phase needs frequent ACKs to measure bandwidth quickly
+            BBRStateMachine::Startup => true,
+            
+            // Drain phase does not frequent ACKs to detect when draining is complete
+            BBRStateMachine::Drain => false,
+            
+            // ProbeRTT needs frequent ACKs to get accurate RTT measurements
+            BBRStateMachine::ProbeRTT => true,
+            
+            // ProbeBW can use relaxed ACKs during stable operation
+            BBRStateMachine::ProbeBW => false,
+        }
+    }
+    
+    /// Check BBR v2 congestion control states that benefit from frequent ACKs  
+    fn check_bbr2_states(&self, congestion: &crate::recovery::congestion::Congestion) -> bool {
+        use crate::recovery::congestion::bbr2::BBR2StateMachine;
+        
+        match congestion.bbr2_state.state {
+            // Startup phase needs frequent ACKs to measure bandwidth quickly
+            BBR2StateMachine::Startup => true,
+            
+            // Drain phase does not need frequent ACKs to detect when draining is complete
+            BBR2StateMachine::Drain => false,
+            
+            // ProbeRTT needs frequent ACKs to get accurate RTT measurements
+            BBR2StateMachine::ProbeRTT => true,
+            
+            // ProbeBW DOWN/REFILL states may need frequent ACKs to detect bandwidth changes
+            BBR2StateMachine::ProbeBWDOWN | BBR2StateMachine::ProbeBWREFILL => true,
+            
+            // ProbeBW CRUISE/UP can use more relaxed ACKs during stable operation  
+            BBR2StateMachine::ProbeBWCRUISE | BBR2StateMachine::ProbeBWUP => false,
+        }
+    }
+
+    /// Check if we should send an ACK based on the new dynamic frequency negotiation.
+    /// This replaces the old rigid frequency check.
+    fn should_send_ack_dynamic(
+        epoch: packet::Epoch, 
+        now: std::time::Instant,
+        ack_eliciting_packets_since_last_ack: u64,
+        ack_eliciting_threshold: u64,
+        ack_deadline: Option<std::time::Instant>
+    ) -> bool {
+        // Always allow ACKs for non-Application epochs (handshake packets)
+        if epoch != packet::Epoch::Application {
+            return true;
+        }
+
+        // Check packet threshold: have we received enough packets?
+        let packet_threshold_met = ack_eliciting_packets_since_last_ack >= ack_eliciting_threshold;
+
+        // Check time threshold: has max_ack_delay passed?
+        let time_threshold_met = if let Some(deadline) = ack_deadline {
+            now >= deadline
+        } else {
+            false
+        };
+
+        let should_ack = packet_threshold_met || time_threshold_met;
+        
+        // Debug: Log ACK decisions
+        if epoch == packet::Epoch::Application {
+            trace!(
+                "DYNAMIC_ACK_DEBUG: packets={}/{}, threshold_met={}, deadline={:?}, time_met={}, should_ack={}",
+                ack_eliciting_packets_since_last_ack, ack_eliciting_threshold,
+                packet_threshold_met,
+                ack_deadline.map(|d| if now >= d { "EXPIRED" } else { "FUTURE" }),
+                time_threshold_met, should_ack
+            );
+        }
+
+        should_ack
+    }
+
+    /// Check packet-level conditions that require immediate ACK.
+    fn check_packet_immediate_ack_conditions_static(
+        hdr: &packet::Header,
+        pkt_num: u64,
+        largest_rx_pkt_num: u64,
+        epoch: packet::Epoch,
+        trace_id: &str,
+    ) -> bool {
+        // Only apply override logic for Application epoch
+        if epoch != packet::Epoch::Application {
+            return false;
+        }
+
+        // 1. ECN CE (Congestion Experienced) checking would go here
+        // TODO: Add ECN CE detection when ECN support is available in packet header
+        
+        // 2. Check for packet number gap larger than threshold (indicating potential loss)
+        let packet_gap_threshold = 3; // Standard QUIC reorder threshold
+        if pkt_num > largest_rx_pkt_num && (pkt_num - largest_rx_pkt_num) > packet_gap_threshold {
+            trace!("{} detected packet gap {} > {}, forcing immediate ACK", 
+                   trace_id, pkt_num - largest_rx_pkt_num, packet_gap_threshold);
+            return true;
+        }
+
+        false
+    }
+
+    /// Check frame-level conditions that require immediate ACK.
+    /// This is called during frame processing in process_frame.
+    fn check_frame_immediate_ack_conditions(&mut self, frame: &frame::Frame, now: std::time::Instant) {
+        match frame {
+            frame::Frame::ImmediateAck => {
+                trace!("{} received IMMEDIATE_ACK frame, forcing immediate ACK", self.trace_id);
+                self.ack_deadline = Some(now);
+                self.ack_eliciting_packets_since_last_ack = self.ack_eliciting_threshold;
+            },
+            frame::Frame::Ping { .. } => {
+                trace!("{} received PING frame, forcing immediate ACK", self.trace_id);
+                self.ack_deadline = Some(now);
+                self.ack_eliciting_packets_since_last_ack = self.ack_eliciting_threshold;
+            },
+            frame::Frame::PathChallenge { .. } => {
+                trace!("{} received PATH_CHALLENGE frame, forcing immediate ACK", self.trace_id);
+                self.ack_deadline = Some(now);
+                self.ack_eliciting_packets_since_last_ack = self.ack_eliciting_threshold;
+            },
+            frame::Frame::ConnectionClose { .. } => {
+                trace!("{} received CONNECTION_CLOSE frame, forcing immediate ACK", self.trace_id);
+                self.ack_deadline = Some(now);
+                self.ack_eliciting_packets_since_last_ack = self.ack_eliciting_threshold;
+            },
+            _ => {},
+        }
+    }
+
+    /// Determine if we should request an immediate ACK for strategic RTT measurements.
+    /// This adds IMMEDIATE_ACK frames to packets that need precise timing feedback.
+    fn should_request_immediate_ack_static(frames: &[frame::Frame]) -> bool {
+        // 1. If packet contains PING frame, request immediate ACK for RTT measurement
+        for frame in frames {
+            if matches!(frame, frame::Frame::Ping { .. }) {
+                return true;
+            }
+        }
+
+        // 2. If packet contains PATH_CHALLENGE frame, request immediate ACK
+        for frame in frames {
+            if matches!(frame, frame::Frame::PathChallenge { .. }) {
+                return true;
+            }
+        }
+
+        // 3. Strategic conditions for immediate ACK:
+        // - First packet after long idle (simplified: skip for now due to complexity)
+        // - Last packet in slow start burst (would need more state tracking)
+        // - When we suspect packet loss and need immediate feedback (would need loss detection state)
+        
+        // For now, we'll rely on the explicit PING and PATH_CHALLENGE triggers
+        // TODO: Add more sophisticated conditions based on congestion state and timing needs
+
+        false
     }
 
     /// Reads the first received DATAGRAM.
@@ -11185,6 +11662,9 @@ impl Connection {
     ) -> Result<()> {
         trace!("{} rx frm {:?}", self.trace_id, frame);
 
+        // Check if this frame requires immediate ACK override
+        self.check_frame_immediate_ack_conditions(&frame, now);
+
         match frame {
             frame::Frame::Padding { .. } => (),
 
@@ -11927,6 +12407,41 @@ impl Connection {
 
             frame::Frame::MaxPathId { max_path_id } => {
                 self.ids.set_remote_max_path_id(max_path_id);
+            },
+
+            frame::Frame::AckFrequency {
+                sequence_number,
+                ack_eliciting_threshold,
+                max_ack_delay,
+                reordering_threshold: _,
+            } => {
+                // Basic validation to prevent crashes
+                if ack_eliciting_threshold > 0 && ack_eliciting_threshold <= 100 &&
+                   max_ack_delay <= 1_000_000 {  // Max 1 second delay
+                    
+                    // Only process if sequence number is newer than last processed
+                    if sequence_number > self.last_ack_frequency_sequence_number {
+                        trace!("{} received ACK_FREQUENCY: seq={}, threshold={}, max_delay={}µs, old_threshold={}", 
+                               self.trace_id, sequence_number, ack_eliciting_threshold, max_ack_delay, self.ack_eliciting_threshold);
+                        
+                        self.ack_eliciting_threshold = ack_eliciting_threshold;
+                        self.max_ack_delay = std::time::Duration::from_micros(max_ack_delay);
+                        self.last_ack_frequency_sequence_number = sequence_number;
+                        
+                        // Reset receiver state when new frequency settings are received
+                        self.ack_eliciting_packets_since_last_ack = 0;
+                        self.ack_deadline = None;
+                    } else {
+                        trace!("{} ignored ACK_FREQUENCY: seq={} <= last_processed={}", 
+                               self.trace_id, sequence_number, self.last_ack_frequency_sequence_number);
+                    }
+                }
+            },
+
+            frame::Frame::ImmediateAck => {
+                // Immediately trigger ACK generation by setting deadline to now
+                self.ack_deadline = Some(now);
+                self.ack_eliciting_packets_since_last_ack = self.ack_eliciting_threshold;
             },
         };
         Ok(())
@@ -22982,3 +23497,6 @@ mod ranges;
 mod recovery;
 mod stream;
 mod tls;
+
+#[cfg(test)]
+mod ack_frequency_tests;

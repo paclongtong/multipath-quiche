@@ -224,6 +224,15 @@ pub enum Frame {
     MaxPathId {
         max_path_id: u64,
     },
+
+    AckFrequency {
+        sequence_number: u64,
+        ack_eliciting_threshold: u64,
+        max_ack_delay: u64,
+        reordering_threshold: Option<u64>,
+    },
+
+    ImmediateAck,
 }
 
 impl Frame {
@@ -421,6 +430,22 @@ impl Frame {
                 max_path_id: b.get_varint()?,
             },
 
+            0x15228c0d => {
+                // ACK_FREQUENCY frame parsing
+                let sequence_number = b.get_varint()?;
+                let ack_eliciting_threshold = b.get_varint()?;
+                let max_ack_delay = b.get_varint()?;
+                
+                Frame::AckFrequency {
+                    sequence_number,
+                    ack_eliciting_threshold,
+                    max_ack_delay,
+                    reordering_threshold: None,
+                }
+            },
+
+            0x15228c0e => Frame::ImmediateAck,
+
             _ => return Err(Error::InvalidFrame),
         };
 
@@ -445,6 +470,8 @@ impl Frame {
             (packet::Type::ZeroRTT, Frame::MpNewConnectionId { .. }) => false,
             (packet::Type::ZeroRTT, Frame::MpRetireConnectionId { .. }) => false,
             (packet::Type::ZeroRTT, Frame::MaxPathId { .. }) => false,
+            (packet::Type::ZeroRTT, Frame::AckFrequency { .. }) => false,
+            (packet::Type::ZeroRTT, Frame::ImmediateAck) => false,
 
             // ACK, CRYPTO and CONNECTION_CLOSE can be sent on all other packet
             // types.
@@ -737,6 +764,25 @@ impl Frame {
 
                 b.put_varint(*max_path_id)?;
             },
+
+            Frame::AckFrequency {
+                sequence_number,
+                ack_eliciting_threshold,
+                max_ack_delay,
+                reordering_threshold: _,
+            } => {
+                b.put_varint(0x15228c0d)?;
+
+                b.put_varint(*sequence_number)?;
+                b.put_varint(*ack_eliciting_threshold)?;
+                b.put_varint(*max_ack_delay)?;
+                
+                // Note: reordering_threshold omitted for now to ensure parsing compatibility
+            },
+
+            Frame::ImmediateAck => {
+                b.put_varint(0x15228c0e)?;
+            },
         }
 
         Ok(before - b.cap())
@@ -984,6 +1030,23 @@ impl Frame {
             Frame::MaxPathId { max_path_id } => {
                 4 + // frame type
                 octets::varint_len(*max_path_id) // path_id
+            },
+
+            Frame::AckFrequency {
+                sequence_number,
+                ack_eliciting_threshold,
+                max_ack_delay,
+                reordering_threshold: _,
+            } => {
+                4 + // frame type (0x15228c0d is 4 bytes as varint)
+                octets::varint_len(*sequence_number) +
+                octets::varint_len(*ack_eliciting_threshold) +
+                octets::varint_len(*max_ack_delay)
+                // Note: reordering_threshold omitted for compatibility
+            },
+
+            Frame::ImmediateAck => {
+                4 // frame type only (0x15228c0e is 4 bytes as varint)
             },
         }
     }
@@ -1288,6 +1351,23 @@ impl Frame {
             Frame::MaxPathId { max_path_id } => QuicFrame::MaxPathId {
                 max_path_id: *max_path_id,
             },
+
+            Frame::AckFrequency {
+                sequence_number,
+                ack_eliciting_threshold,
+                max_ack_delay,
+                reordering_threshold,
+            } => QuicFrame::AckFrequency {
+                sequence_number: *sequence_number,
+                ack_eliciting_threshold: *ack_eliciting_threshold,
+                max_ack_delay: *max_ack_delay,
+                reordering_threshold: *reordering_threshold,
+            },
+
+            Frame::ImmediateAck => QuicFrame::ImmediateAck {
+                length: None,  // Frame length not tracked currently
+                payload_length: Some(0),  // IMMEDIATE_ACK has no payload
+            },
         }
     }
 }
@@ -1517,6 +1597,25 @@ impl std::fmt::Debug for Frame {
 
             Frame::MaxPathId { max_path_id } => {
                 write!(f, "MAX_PATH_ID max_path_id={max_path_id}")?;
+            },
+
+            Frame::AckFrequency {
+                sequence_number,
+                ack_eliciting_threshold,
+                max_ack_delay,
+                reordering_threshold,
+            } => {
+                write!(
+                    f,
+                    "ACK_FREQUENCY seq={sequence_number} threshold={ack_eliciting_threshold} max_delay={max_ack_delay}"
+                )?;
+                if let Some(reorder) = reordering_threshold {
+                    write!(f, " reorder_threshold={reorder}")?;
+                }
+            },
+
+            Frame::ImmediateAck => {
+                write!(f, "IMMEDIATE_ACK")?;
             },
         }
 

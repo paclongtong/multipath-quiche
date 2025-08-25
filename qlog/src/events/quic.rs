@@ -560,6 +560,18 @@ pub enum QuicFrame {
         max_path_id: u64,
     },
 
+    AckFrequency {
+        sequence_number: u64,
+        ack_eliciting_threshold: u64,
+        max_ack_delay: u64,
+        reordering_threshold: Option<u64>,
+    },
+
+    ImmediateAck {
+        length: Option<u32>,
+        payload_length: Option<u32>,
+    },
+
     Unknown {
         raw_frame_type: u64,
         frame_type_value: Option<u64>,
