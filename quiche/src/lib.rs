@@ -9640,6 +9640,31 @@ impl Connection {
         // Note: We'll add a separate flag for immediate ACK later if needed
     }
 
+    /// Calculates a dynamic ACK eliciting threshold during Slow Start.
+    ///
+    /// The threshold scales with the congestion window to reduce ACK load as
+    /// the window grows, while remaining responsive.
+    fn calculate_slow_start_ack_threshold(&self, path: &crate::path::Path) -> u64 {
+        const MIN_THRESHOLD: u64 = 2;
+        const MAX_THRESHOLD_CSS: u64 = 8;   // Leave room for css max ACK threshold to be modified
+        const MAX_THRESHOLD_DEFAULT: u64 = 8;
+        const SCALING_DIVISOR: usize = 8; // Tune to adjust scaling aggressiveness.
+
+        // Both CSS and normal slow start can scale from 2 to 8
+        let max_threshold = if path.recovery.congestion.hystart.in_css() {
+            MAX_THRESHOLD_CSS
+        } else {
+            MAX_THRESHOLD_DEFAULT
+        };
+
+        // Scale the threshold based on how many packets fit in the CWND.
+        let cwnd_in_packets = path.recovery.congestion.congestion_window / path.recovery.max_datagram_size();
+
+        let proposed_threshold = (cwnd_in_packets / SCALING_DIVISOR) as u64;
+        // Clamp the final value between the minimum and the calculated maximum.
+        proposed_threshold.clamp(MIN_THRESHOLD, max_threshold)
+    }
+
     /// Check if sender conditions warrant an ACK frequency update based on data path congestion state.
     /// This should be called during data transmission on the data path to monitor congestion.
     fn check_ack_frequency_triggers_on_data_path(&mut self, data_path_id: usize) {
@@ -9666,28 +9691,49 @@ impl Connection {
                    self.trace_id, data_path_id, in_slow_start, in_recovery, algorithm_specific_need_frequent_acks,
                    congestion.cubic_state.state);
             
-            let should_request_frequent_acks = in_recovery || algorithm_specific_need_frequent_acks;
-            let should_request_relaxed_acks = !should_request_frequent_acks;
-            
-            trace!("{} current threshold={}, should_request_frequent={}, should_request_relaxed={}", 
-                   self.trace_id, self.requested_ack_eliciting_threshold, should_request_frequent_acks, should_request_relaxed_acks);
-            
-            if should_request_frequent_acks && self.requested_ack_eliciting_threshold != 2 {
-                trace!("{} data path {} needs frequent ACKs (slow_start={}, recovery={}, algo_specific={})", 
-                       self.trace_id, data_path_id, in_slow_start, in_recovery, algorithm_specific_need_frequent_acks);
-                self.request_frequent_acks();
-            } else if should_request_relaxed_acks && self.requested_ack_eliciting_threshold != 10 {
-                trace!("{} data path {} can use relaxed ACKs", self.trace_id, data_path_id);
-                
-                // Use smoothed RTT of data path for max_ack_delay in relaxed mode
-                let smoothed_rtt_us = data_path.recovery.rtt().as_micros() as u64;
-                self.requested_ack_eliciting_threshold = 10;
-                self.requested_max_ack_delay = smoothed_rtt_us.max(25000); // At least 25ms
-                // self.requested_max_ack_delay = 25000; // At most 25ms
+            // Determine the new threshold based on the CC state using three-tiered approach
+            let new_threshold = if in_recovery {
+                // State 1: In Recovery. Always use the most frequent setting.
+                2
+            } else if !algorithm_specific_need_frequent_acks {
+                // State 2: In Congestion Avoidance / Stable. Use relaxed setting.
+                10
+            } else {
+                // State 3: In Slow Start / Startup. Use the new dynamic scaling logic.
+                self.calculate_slow_start_ack_threshold(data_path)
+            };
+
+            // If the calculated threshold has changed, flag an update.
+            if new_threshold != self.requested_ack_eliciting_threshold {
+                trace!(
+                    "{} ACK frequency change determined: new_threshold={}, current_requested={}",
+                    self.trace_id, new_threshold, self.requested_ack_eliciting_threshold
+                );
+
+                // Update the connection's requested state.
+                self.requested_ack_eliciting_threshold = new_threshold;
+
+                // Adjust max_ack_delay based on the new threshold.
+                self.requested_max_ack_delay = if new_threshold > 2 {
+                    // Use a static 25ms for relaxed ACK modes.
+                    25000
+                } else {
+                    // For frequent ACKs, use a delay based on the ACK-path's min_rtt
+                    // to ensure timely feedback without causing ACK storms.
+                    // The ACK path is always the opposite of the data path.
+                    let ack_path_id = if data_path_id == 0 { 1 } else { 0 };
+                    let ack_path_rtt = self.paths.get(ack_path_id)
+                        .ok()
+                        .and_then(|p| p.recovery.min_rtt())
+                        .unwrap_or(std::time::Duration::from_millis(5));
+
+                    (ack_path_rtt.as_micros() as u64).max(5000)
+                };
+
                 self.needs_ack_frequency_update = true;
             } else {
-                trace!("{} no ACK frequency change needed (current={}, frequent_needed={}, relaxed_needed={})", 
-                       self.trace_id, self.requested_ack_eliciting_threshold, should_request_frequent_acks, should_request_relaxed_acks);
+                trace!("{} no ACK frequency change needed (current={})", 
+                       self.trace_id, self.requested_ack_eliciting_threshold);
             }
         }
     }
