@@ -1743,6 +1743,7 @@ pub struct Connection {
     last_ack_frequency_sequence_number: u64,
     ack_eliciting_packets_since_last_ack: u64,
     ack_deadline: Option<std::time::Instant>,
+    last_packet_recv_time: Option<std::time::Instant>,
 }
 
 /// Creates a new server-side connection.
@@ -2205,6 +2206,7 @@ impl Connection {
             last_ack_frequency_sequence_number: 0,
             ack_eliciting_packets_since_last_ack: 0,
             ack_deadline: None,
+            last_packet_recv_time: None,
         };
 
         // Don't support multipath with zero-length CIDs.
@@ -3429,7 +3431,7 @@ impl Connection {
         pkt_num_space.recv_pkt_need_ack.push_item(pn);
         
         // Check for immediate ACK conditions based on packet characteristics
-        let needs_immediate_ack = Connection::check_packet_immediate_ack_conditions_static(&hdr, pn, pkt_num_space.largest_rx_pkt_num, epoch, &self.trace_id);
+        let needs_immediate_ack = Connection::check_packet_immediate_ack_conditions_static(&hdr, pn, pkt_num_space.largest_rx_pkt_num, epoch, &self.trace_id, now, self.last_packet_recv_time);
         
         // Update dynamic ACK frequency tracking for Application epoch
         if epoch == packet::Epoch::Application && ack_elicited {
@@ -3480,6 +3482,9 @@ impl Connection {
 
         self.recv_count += 1;
         self.paths.get_mut(recv_pid)?.recv_count += 1;
+        
+        // Update last packet received time for PTO probe detection
+        self.last_packet_recv_time = Some(now);
 
         let read = b.off() + aead_tag_len;
 
@@ -9667,7 +9672,7 @@ impl Connection {
             trace!("{} current threshold={}, should_request_frequent={}, should_request_relaxed={}", 
                    self.trace_id, self.requested_ack_eliciting_threshold, should_request_frequent_acks, should_request_relaxed_acks);
             
-            if should_request_frequent_acks && self.requested_ack_eliciting_threshold != 1 {
+            if should_request_frequent_acks && self.requested_ack_eliciting_threshold != 2 {
                 trace!("{} data path {} needs frequent ACKs (slow_start={}, recovery={}, algo_specific={})", 
                        self.trace_id, data_path_id, in_slow_start, in_recovery, algorithm_specific_need_frequent_acks);
                 self.request_frequent_acks();
@@ -9678,6 +9683,7 @@ impl Connection {
                 let smoothed_rtt_us = data_path.recovery.rtt().as_micros() as u64;
                 self.requested_ack_eliciting_threshold = 10;
                 self.requested_max_ack_delay = smoothed_rtt_us.max(25000); // At least 25ms
+                // self.requested_max_ack_delay = 25000; // At most 25ms
                 self.needs_ack_frequency_update = true;
             } else {
                 trace!("{} no ACK frequency change needed (current={}, frequent_needed={}, relaxed_needed={})", 
@@ -9821,6 +9827,8 @@ impl Connection {
         largest_rx_pkt_num: u64,
         epoch: packet::Epoch,
         trace_id: &str,
+        now: std::time::Instant,
+        last_packet_recv_time: Option<std::time::Instant>,
     ) -> bool {
         // Only apply override logic for Application epoch
         if epoch != packet::Epoch::Application {
@@ -9836,6 +9844,16 @@ impl Connection {
             trace!("{} detected packet gap {} > {}, forcing immediate ACK", 
                    trace_id, pkt_num - largest_rx_pkt_num, packet_gap_threshold);
             return true;
+        }
+
+        // 3. Check for packet arriving after idle period (potential PTO probe)
+        let idle_threshold = std::time::Duration::from_millis(100); // A conservative fixed value
+        if let Some(last_time) = last_packet_recv_time {
+            if now.saturating_duration_since(last_time) > idle_threshold {
+                trace!("{} detected packet after idle period > {:?}, forcing immediate ACK",
+                       trace_id, idle_threshold);
+                return true;
+            }
         }
 
         false
