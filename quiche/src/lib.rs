@@ -9646,8 +9646,8 @@ impl Connection {
     /// the window grows, while remaining responsive.
     fn calculate_slow_start_ack_threshold(&self, path: &crate::path::Path) -> u64 {
         const MIN_THRESHOLD: u64 = 2;
-        const MAX_THRESHOLD_CSS: u64 = 8;   // Leave room for css max ACK threshold to be modified
-        const MAX_THRESHOLD_DEFAULT: u64 = 8;
+        const MAX_THRESHOLD_CSS: u64 = 16;   // Leave room for css max ACK threshold to be modified
+        const MAX_THRESHOLD_DEFAULT: u64 = 16;
         const SCALING_DIVISOR: usize = 8; // Tune to adjust scaling aggressiveness.
 
         // Both CSS and normal slow start can scale from 2 to 8
@@ -9697,7 +9697,7 @@ impl Connection {
                 2
             } else if !algorithm_specific_need_frequent_acks {
                 // State 2: In Congestion Avoidance / Stable. Use relaxed setting.
-                10
+                16
             } else {
                 // State 3: In Slow Start / Startup. Use the new dynamic scaling logic.
                 self.calculate_slow_start_ack_threshold(data_path)
