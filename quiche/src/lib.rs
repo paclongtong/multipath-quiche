@@ -5419,6 +5419,29 @@ impl Connection {
         self.send_on_path(out, from, to)
     }
 
+    /// Send packet on path with forced PATH_CHALLENGE frame for path probing
+    pub fn send_on_path_with_challenge(
+        &mut self, out: &mut [u8], from: Option<SocketAddr>,
+        to: Option<SocketAddr>
+    ) -> Result<(usize, SendInfo)> {
+        // Find the path we're sending on
+        let send_pid = match (from, to) {
+            (Some(f), Some(t)) => self
+                .paths
+                .path_id_from_addrs(&(f, t))
+                .ok_or(Error::InvalidState)?,
+            _ => self.get_send_path_id(from, to)?,
+        };
+
+        // Force path validation to trigger PATH_CHALLENGE frame
+        if let Ok(send_path) = self.paths.get_mut(send_pid) {
+            send_path.request_validation();
+        }
+
+        // Use the regular send method, which will now include PATH_CHALLENGE frames
+        self.send_on_path(out, from, to)
+    }
+
     pub fn send_on_path_separate_server(
         &mut self, out: &mut [u8], from: Option<SocketAddr>,
         to: Option<SocketAddr>,

@@ -652,28 +652,26 @@ impl Recovery {
 
         if largest_newly_acked.pkt_num == largest_acked && has_ack_eliciting {
             let latest_rtt = now - largest_newly_acked.time_sent;
-            // if self.path_id == 1 {
-            //     self.rtt_stats.update_rtt(
-            //         latest_rtt,
-            //         Duration::from_micros(ack_delay),
-            //         now,
-            //         handshake_status.completed,
-            //     );
-            // } else {
-            //     self.rtt_stats.update_rtt_special(
-            //         latest_rtt,
-            //         Duration::from_micros(ack_delay),
-            //         now,
-            //         handshake_status.completed,
-            //     );
-            // }
             self.rtt_stats.update_rtt(
                 latest_rtt,
                 Duration::from_micros(ack_delay),
                 now,
                 handshake_status.completed,
             );
-
+        } else if has_ack_eliciting {
+            // Also update RTT for any ACK-eliciting packet (including PING)
+            // This fixes the issue where PING packets don't trigger RTT updates
+            // when they're not the largest packet being acknowledged
+            // Since has_ack_eliciting is true, we know at least one packet was ACK-eliciting
+            if let Some(acked_packet) = self.newly_acked.first() {
+                let latest_rtt = now - acked_packet.time_sent;
+                self.rtt_stats.update_rtt(
+                    latest_rtt,
+                    Duration::from_micros(ack_delay),
+                    now,
+                    handshake_status.completed,
+                );
+            }
         }
 
         // Detect and mark lost packets without removing them from the sent
@@ -765,7 +763,27 @@ impl Recovery {
                     handshake_status.completed,
                 );
             }
-
+        } else if has_ack_eliciting {
+            // Also update RTT for any ACK-eliciting packet (including PING)
+            // Since has_ack_eliciting is true, we know at least one packet was ACK-eliciting
+            if let Some(acked_packet) = self.newly_acked.first() {
+                let latest_rtt = now - acked_packet.time_sent;
+                if self.path_id == 0 && is_server {
+                    self.rtt_stats.update_rtt_special(
+                        latest_rtt,
+                        Duration::from_micros(ack_delay),
+                        now,
+                        handshake_status.completed,
+                    );
+                } else {
+                    self.rtt_stats.update_rtt(
+                        latest_rtt,
+                        Duration::from_micros(ack_delay),
+                        now,
+                        handshake_status.completed,
+                    );
+                }
+            }
         }
 
         // Detect and mark lost packets without removing them from the sent

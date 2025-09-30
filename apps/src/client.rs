@@ -28,6 +28,7 @@ use crate::args::*;
 use crate::common::*;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::net::ToSocketAddrs;
 use std::time::{Duration, Instant};
@@ -63,8 +64,11 @@ pub struct ProbingMetrics {
     pub path1_rtt_samples: usize,
     pub ping_frames_sent: u64,
     pub ping_frames_acked: u64,
+    pub challenge_frames_sent: u64,
+    pub challenge_frames_responded: u64,
     pub last_ping_time: Option<Instant>,
     pub ack_eliciting_ratio: f64,
+    pub rtt_history: VecDeque<(Instant, Duration)>, // Track RTT history for congestion detection
 }
 
 impl ProbingMetrics {
@@ -74,8 +78,11 @@ impl ProbingMetrics {
             path1_rtt_samples: 0,
             ping_frames_sent: 0,
             ping_frames_acked: 0,
+            challenge_frames_sent: 0,
+            challenge_frames_responded: 0,
             last_ping_time: None,
             ack_eliciting_ratio: 0.0,
+            rtt_history: VecDeque::new(),
         }
     }
 
@@ -96,6 +103,15 @@ impl ProbingMetrics {
         self.last_ping_time = Some(now);
     }
 
+    pub fn record_challenge_sent(&mut self, now: Instant) {
+        self.challenge_frames_sent += 1;
+        self.last_ping_time = Some(now); // Reuse for rate limiting both types
+    }
+
+    pub fn record_challenge_responded(&mut self) {
+        self.challenge_frames_responded += 1;
+    }
+
     pub fn can_send_ping(&self, now: Instant, min_interval: Duration) -> bool {
         // Enforce minimum interval between PING frames
         if let Some(last_ping) = self.last_ping_time {
@@ -112,6 +128,61 @@ impl ProbingMetrics {
             }
         }
         
+        true
+    }
+
+    pub fn update_rtt(&mut self, path_id: u64, rtt: Duration, now: Instant) {
+        self.rtt_history.push_back((now, rtt));
+        // Keep only recent history (last 30 seconds)
+        while let Some(&(time, _)) = self.rtt_history.front() {
+            if now.duration_since(time) > Duration::from_secs(30) {
+                self.rtt_history.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn should_probe_path(&self, path_id: u64, current_rtt: Duration, now: Instant) -> bool {
+        // Don't probe if RTT is growing rapidly (indicating queue buildup)
+        // if self.rtt_history.len() >= 3 {
+        //     let recent_rtts: Vec<Duration> = self.rtt_history.iter()
+        //         .rev().take(3).map(|(_, rtt)| *rtt).collect();
+        //     if recent_rtts.len() >= 2 {
+        //         let rtt_growth = recent_rtts[0].as_millis() as f64 / recent_rtts.last().unwrap().as_millis() as f64;
+        //         if rtt_growth > 1.5 { // RTT grew by 50%
+        //             debug!("Backing off probing on path {} due to RTT growth: {:.2}x", path_id, rtt_growth);
+        //             return false;
+        //         }
+        //     }
+        // }
+
+        // // Check basic rate limiting
+        // if let Some(last_ping) = self.last_ping_time {
+        //     let time_since_ping = now.duration_since(last_ping);
+        //     // Adaptive interval: scale with current RTT to avoid overwhelming queues
+        //     let adaptive_interval = Duration::from_millis(500.max(current_rtt.as_millis() as u64));
+        //     if time_since_ping < adaptive_interval {
+        //         return false;
+        //     }
+        // }
+
+        // // // Don't send more PINGs if success rate is too low
+        // if self.ping_frames_sent > 0 {
+        //     let success_rate = self.ping_frames_acked as f64 / self.ping_frames_sent as f64;
+        //     if success_rate < 0.5 && self.ping_frames_sent >= 3 {
+        //         return false;
+        //     }
+        // }
+
+        // // Don't send more PATH_CHALLENGEs if success rate is too low
+        // if self.challenge_frames_sent > 0 {
+        //     let challenge_success_rate = self.challenge_frames_responded as f64 / self.challenge_frames_sent as f64;
+        //     if challenge_success_rate < 0.5 && self.challenge_frames_sent >= 3 {
+        //         return false;
+        //     }
+        // }
+
         true
     }
 
@@ -209,6 +280,206 @@ impl EarlyPhaseDetector {
         
         (base_freq * time_factor * cwnd_factor).min(0.1) // Cap at 10% instead of 50%
     }
+}
+
+#[derive(Debug)]
+pub struct PathRoleSwitchDetector {
+    current_ack_path: Option<u64>,
+    previous_ack_path: Option<u64>,
+    paths_in_probing_mode: HashSet<u64>,
+    switch_detected_time: Option<Instant>,
+    last_rtt_updates: HashMap<u64, (Instant, Duration)>, // (last_update_time, last_rtt)
+    probing_triggers: HashMap<u64, Instant>, // When to send next PING per path
+    min_probing_interval: Duration,
+    switch_timeout: Duration,
+    // New fields for switch stability
+    ack_path_stable_since: Option<Instant>, // When current ACK path became stable
+    min_stable_duration: Duration, // Minimum time before considering a switch "stable"
+    last_switch_time: Option<Instant>, // When the last switch occurred
+    min_switch_interval: Duration, // Minimum time between processing switches
+}
+
+impl PathRoleSwitchDetector {
+    pub fn new() -> Self {
+        PathRoleSwitchDetector {
+            current_ack_path: None,
+            previous_ack_path: None,
+            paths_in_probing_mode: HashSet::new(),
+            switch_detected_time: None,
+            last_rtt_updates: HashMap::new(),
+            probing_triggers: HashMap::new(),
+            min_probing_interval: Duration::from_millis(500),
+            switch_timeout: Duration::from_secs(30),
+            // Initialize stability tracking
+            ack_path_stable_since: None,
+            min_stable_duration: Duration::from_secs(2), // Require 2 seconds of stability
+            last_switch_time: None,
+            min_switch_interval: Duration::from_millis(1000), // Ignore switches within 1 second
+        }
+    }
+
+    pub fn detect_path_switch(&mut self, conn: &quiche::Connection) -> bool {
+        let now = Instant::now();
+
+        // Get the current ACK path (lowest RTT path)
+        let current_ack_path = conn.path_stats()
+            .filter(|p| !matches!(p.state, quiche::PathState::Closed(_, _)))
+            .min_by_key(|p| p.rtt)
+            .map(|p| p.path_id);
+
+        // Check if this is a new path or path switch
+        let path_changed = match (self.current_ack_path, current_ack_path) {
+            (Some(prev), Some(curr)) if prev != curr => true,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+
+        let mut stable_switch_detected = false;
+
+        if path_changed {
+            // Rate limit switch processing to avoid oscillation
+            let should_process_switch = self.last_switch_time
+                .map_or(true, |last_time| now.duration_since(last_time) >= self.min_switch_interval);
+
+            if should_process_switch {
+                if let (Some(prev_path), Some(curr_path)) = (self.current_ack_path, current_ack_path) {
+                    info!("ACK path switch detected: {} -> {} (processing)", prev_path, curr_path);
+
+                    // Clean up: if the new ACK path was in probing mode, remove it
+                    if self.paths_in_probing_mode.remove(&curr_path) {
+                        info!("Path {} reactivated as ACK path, removing from probing mode", curr_path);
+                        self.probing_triggers.remove(&curr_path);
+                    }
+
+                    self.previous_ack_path = Some(prev_path);
+                    self.last_switch_time = Some(now);
+                } else if let Some(curr_path) = current_ack_path {
+                    info!("Initial ACK path detected: {}", curr_path);
+                }
+
+                self.current_ack_path = current_ack_path;
+                self.ack_path_stable_since = Some(now); // Reset stability timer
+            } else {
+                // Switch detected but ignored due to rate limiting
+                debug!("ACK path switch detected but ignored (too frequent)");
+            }
+        } else if let Some(stable_since) = self.ack_path_stable_since {
+            // Check if current path has been stable long enough to trigger probing
+            let is_stable = now.duration_since(stable_since) >= self.min_stable_duration;
+
+            if is_stable && self.switch_detected_time.is_none() {
+                // Path has been stable, now we can safely start probing the previous path
+                if let (Some(prev_path), Some(_curr_path)) = (self.previous_ack_path, self.current_ack_path) {
+                    info!("ACK path {} stable for {:?}, starting probing of previous path {}",
+                          _curr_path, self.min_stable_duration, prev_path);
+
+                    self.paths_in_probing_mode.insert(prev_path);
+                    self.switch_detected_time = Some(now);
+                    stable_switch_detected = true;
+                }
+            }
+        }
+
+        // Update RTT tracking for all paths
+        for path_stat in conn.path_stats() {
+            if !matches!(path_stat.state, quiche::PathState::Closed(_, _)) {
+                if let Some((_last_time, last_rtt)) = self.last_rtt_updates.get(&path_stat.path_id) {
+                    // Check if RTT was updated
+                    if path_stat.rtt != *last_rtt {
+                        self.last_rtt_updates.insert(path_stat.path_id, (now, path_stat.rtt));
+
+                        // Check if any probing paths have recovered
+                        self.path_recovered(path_stat.path_id, path_stat.rtt);
+
+                        // If this is the active path and we have paths in probing mode, schedule probing
+                        if Some(path_stat.path_id) == self.current_ack_path && !self.paths_in_probing_mode.is_empty() {
+                            self.schedule_probing_for_inactive_paths(now);
+                        }
+                    }
+                } else {
+                    // First time seeing this path
+                    self.last_rtt_updates.insert(path_stat.path_id, (now, path_stat.rtt));
+                }
+            }
+        }
+
+        stable_switch_detected
+    }
+
+    fn schedule_probing_for_inactive_paths(&mut self, now: Instant) {
+        for &path_id in &self.paths_in_probing_mode {
+            // Schedule probing if not already scheduled or enough time has passed
+            let should_schedule = self.probing_triggers.get(&path_id)
+                .map_or(true, |&last_trigger| now.duration_since(last_trigger) >= self.min_probing_interval);
+
+            if should_schedule {
+                self.probing_triggers.insert(path_id, now);
+                debug!("Scheduled probing for inactive path {} due to RTT update on active path", path_id);
+            }
+        }
+    }
+
+    pub fn should_probe_path(&mut self, path_id: u64, conn: &quiche::Connection) -> bool {
+        let now = Instant::now();
+
+        // Clean up expired paths from probing mode
+        if let Some(switch_time) = self.switch_detected_time {
+            if now.duration_since(switch_time) > self.switch_timeout {
+                info!("Probing timeout reached, clearing all probing state");
+                self.paths_in_probing_mode.clear();
+                self.probing_triggers.clear();
+                self.switch_detected_time = None; // Reset so new switches can be processed
+                return false;
+            }
+        }
+
+        // Check if this path should be probed
+        if !self.paths_in_probing_mode.contains(&path_id) {
+            return false;
+        }
+
+        // Check if probing is scheduled and timing is right
+        if let Some(&scheduled_time) = self.probing_triggers.get(&path_id) {
+            if now >= scheduled_time {
+                // Remove the trigger since we're about to probe
+                self.probing_triggers.remove(&path_id);
+                debug!("Probing path {} after role switch", path_id);
+                return true;
+            }
+        }
+
+        false
+    }
+
+    pub fn path_recovered(&mut self, path_id: u64, new_rtt: Duration) {
+        // Remove path from probing mode if RTT significantly improved
+        if let Some((_, old_rtt)) = self.last_rtt_updates.get(&path_id) {
+            if new_rtt < *old_rtt / 2 { // RTT improved by at least 50%
+                if self.paths_in_probing_mode.remove(&path_id) {
+                    self.probing_triggers.remove(&path_id);
+                    info!("Path {} recovered, removing from probing mode (RTT: {:?} -> {:?})",
+                           path_id, old_rtt, new_rtt);
+
+                    // If no more paths in probing mode, reset switch detected time
+                    if self.paths_in_probing_mode.is_empty() {
+                        self.switch_detected_time = None;
+                        debug!("All paths recovered, ready for new switch detection");
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn get_probing_paths(&self) -> &HashSet<u64> {
+        &self.paths_in_probing_mode
+    }
+}
+
+// Helper function to get path_id from local and peer addresses
+fn get_path_id_from_addrs(conn: &quiche::Connection, local_addr: std::net::SocketAddr, peer_addr: std::net::SocketAddr) -> Option<u64> {
+    conn.path_stats()
+        .find(|p| p.local_addr == local_addr && p.peer_addr == peer_addr)
+        .map(|p| p.path_id)
 }
 
 pub fn connect(
@@ -429,6 +700,9 @@ pub fn connect(
     };
 
     let mut probing_metrics = ProbingMetrics::new();
+
+    // Initialize path role switch detector for post-switch probing
+    let mut path_switch_detector = PathRoleSwitchDetector::new();
 
     loop {
         if !conn.is_in_early_data() || app_proto_selected {
@@ -801,6 +1075,9 @@ pub fn connect(
             }
         }
         else{
+            // Detect path role switches for post-switch probing
+            path_switch_detector.detect_path_switch(&conn);
+
             // conn.send_ack_eliciting_on_path()
             for (local_addr, peer_addr, is_low_latency) in scheduled_tuples {
                 // let send_pid = 0;
@@ -829,40 +1106,67 @@ pub fn connect(
                 let socket = &sockets[token];
                 let is_ack = is_low_latency;
                 loop {
-                    // Decide whether to use PING-enhanced sending
-                    let use_ping_enhanced = is_low_latency && 
+                    // Decide whether to use PING-enhanced sending for early probing
+                    let use_early_probing = is_low_latency &&
                         args.enable_early_path_probing &&
                         early_phase_detector.as_mut().map_or(false, |detector| detector.needs_active_probing(&conn));
-                    
-                    // Use probing frequency to decide if this packet should get PING
-                    let should_add_ping = if use_ping_enhanced {
+
+                    // Decide whether to use post-switch probing for inactive paths
+                    let use_post_switch_probing = if let Some(path_id) = get_path_id_from_addrs(&conn, local_addr, peer_addr) {
+                        path_switch_detector.should_probe_path(path_id, &conn)
+                    } else {
+                        false
+                    };
+
+                    // Use improved congestion-aware probing logic
+                    let should_add_ping = if use_early_probing || use_post_switch_probing {
                         let now = Instant::now();
-                        let min_ping_interval = Duration::from_millis(500); // Minimum 500ms between PINGs
-                        
-                        // Check rate limiting first
-                        if !probing_metrics.can_send_ping(now, min_ping_interval) {
-                            false
+
+                        // Get current RTT for this path for adaptive scaling
+                        let current_rtt = if let Some(path_id) = get_path_id_from_addrs(&conn, local_addr, peer_addr) {
+                            conn.path_stats()
+                                .find(|p| p.path_id == path_id)
+                                .map(|p| p.rtt)
+                                .unwrap_or(Duration::from_millis(50))
                         } else {
+                            Duration::from_millis(50)
+                        };
+
+                        // Update RTT history for congestion detection
+                        if let Some(path_id) = get_path_id_from_addrs(&conn, local_addr, peer_addr) {
+                            probing_metrics.update_rtt(path_id, current_rtt, now);
+                        }
+
+                        // Use congestion-aware probing decision
+                        let path_id = get_path_id_from_addrs(&conn, local_addr, peer_addr).unwrap_or(0);
+                        let can_probe = probing_metrics.should_probe_path(path_id, current_rtt, now);
+
+                        if !can_probe {
+                            false
+                        } else if use_early_probing {
+                            // Early probing: use probabilistic approach with congestion awareness
                             let freq = early_phase_detector.as_ref().map_or(0.0, |detector| detector.get_probing_frequency(&conn));
-                            // Simple probabilistic decision based on packet count
                             (pkt_count % 100) as f64 / 100.0 < freq
+                        } else {
+                            // Post-switch probing: deterministic but congestion-aware
+                            true
                         }
                     } else {
                         false
                     };
                     
                     let (write, send_info) = if should_add_ping {
-                        // Record that we're sending a PING frame
+                        // Record that we're sending a probing frame
                         let now = Instant::now();
                         probing_metrics.record_ping_sent(now);
-                        debug!("Adding PING frame to ACK packet for early path probing on {:?} -> {:?}", local_addr, peer_addr);
-                        
-                        // Use PING-enhanced sending
-                        match conn.send_on_path_with_ping(
-                            &mut out,
-                            Some(local_addr),
-                            Some(peer_addr)
-                        ) {
+                        if use_early_probing {
+                            debug!("Adding PING frame for early path probing on {:?} -> {:?}", local_addr, peer_addr);
+                            // Use PING-enhanced sending for early probing
+                            match conn.send_on_path_with_ping(
+                                &mut out,
+                                Some(local_addr),
+                                Some(peer_addr)
+                            ) {
                             Ok(v) => v,
                             Err(quiche::Error::Done) => {
                                 // Fall back to regular separate sending if PING method fails
@@ -887,6 +1191,44 @@ pub fn connect(
                                 conn.close(false, 0x1, b"fail").ok();
                                 break;
                             }
+                        }
+                        } else if use_post_switch_probing {
+                            info!("Adding PATH_CHALLENGE frame for post-switch path probing on {:?} -> {:?}", local_addr, peer_addr);
+                            // Record that we're sending a PATH_CHALLENGE frame
+                            probing_metrics.record_challenge_sent(now);
+                            // Use PATH_CHALLENGE for post-switch probing
+                            match conn.send_on_path_with_challenge(
+                                &mut out,
+                                Some(local_addr),
+                                Some(peer_addr)
+                            ) {
+                                Ok(v) => v,
+                                Err(quiche::Error::Done) => {
+                                    // Fall back to regular separate sending if PATH_CHALLENGE method fails
+                                    match conn.send_on_path_separate(
+                                        &mut out,
+                                        Some(local_addr),
+                                        Some(peer_addr),
+                                        &mut Some(is_ack)
+                                    ) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            trace!("{} -> {}: done writing", local_addr, peer_addr);
+                                            break;
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    error!(
+                                        "{} -> {}: send failed: {:?}",
+                                        local_addr, peer_addr, e
+                                    );
+                                    conn.close(false, 0x1, b"fail").ok();
+                                    break;
+                                }
+                            }
+                        } else {
+                            unreachable!("should_add_ping is true but no probing type selected");
                         }
                     } else {
                         // Use regular separate sending
